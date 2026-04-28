@@ -656,6 +656,13 @@ fn percent_change(current: u64, previous: u64) -> f64 {
     ((current as f64 - previous as f64) / previous as f64) * 100.0
 }
 
+fn count_to_u32(count: i64) -> u32 {
+    if count <= 0 {
+        return 0;
+    }
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 fn build_trends(current: &StatsSnapshot, previous: &StatsSnapshot) -> StatsTrends {
     let prev_patterns: HashMap<&str, i32> = previous
         .top_patterns
@@ -692,15 +699,19 @@ impl CommandEntry {
     /// Compute a SHA256 hash of the command for deduplication/grouping.
     #[must_use]
     pub fn command_hash(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.command.as_bytes());
-        let digest = hasher.finalize();
-        let mut hex = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            let _ = write!(hex, "{byte:02x}");
-        }
-        hex
+        command_hash_for(&self.command)
     }
+}
+
+fn command_hash_for(command: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(command.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// History database handle.
@@ -835,6 +846,60 @@ impl HistoryDb {
         let row = self.conn.query_row("SELECT COUNT(*) FROM commands")?;
         let count = sv_to_i64(&row.values()[0]);
         Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Count recent blocked occurrences of an exact command across all sessions.
+    ///
+    /// This supports graduated responses by letting callers detect commands
+    /// that repeatedly hit destructive rules within a configured window. The
+    /// query uses the command hash for selectivity and confirms the raw command
+    /// to avoid treating a theoretical hash collision as the same command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_history_count(&self, command: &str, window: Duration) -> Result<u32, HistoryError> {
+        let cutoff_ts = format_timestamp(Utc::now() - window);
+        let command_hash = command_hash_for(command);
+        let row = self.conn.query_row_with_params(
+            "SELECT COUNT(*) FROM commands
+             WHERE command_hash = ?1
+               AND command = ?2
+               AND outcome = 'deny'
+               AND timestamp >= ?3",
+            &[
+                text_sv(command_hash),
+                text_sv(command.to_string()),
+                text_sv(cutoff_ts),
+            ],
+        )?;
+        Ok(count_to_u32(sv_to_i64(&row.values()[0])))
+    }
+
+    /// Count recent blocked occurrences for a rule/pattern across all sessions.
+    ///
+    /// The `pattern_id` should be the stable history `rule_id`
+    /// (`pack_id:pattern_name`). Counting by rule is often more useful than
+    /// exact command matching because command variants can represent the same
+    /// destructive behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_history_count_by_pattern(
+        &self,
+        pattern_id: &str,
+        window: Duration,
+    ) -> Result<u32, HistoryError> {
+        let cutoff_ts = format_timestamp(Utc::now() - window);
+        let row = self.conn.query_row_with_params(
+            "SELECT COUNT(*) FROM commands
+             WHERE rule_id = ?1
+               AND outcome = 'deny'
+               AND timestamp >= ?2",
+            &[text_sv(pattern_id.to_string()), text_sv(cutoff_ts)],
+        )?;
+        Ok(count_to_u32(sv_to_i64(&row.values()[0])))
     }
 
     /// Prune history entries older than the specified number of days.
@@ -1156,6 +1221,21 @@ impl HistoryDb {
             }
         }
 
+        self.ensure_cross_session_indexes()?;
+
+        Ok(())
+    }
+
+    fn ensure_cross_session_indexes(&self) -> Result<(), HistoryError> {
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_commands_command_hash_outcome_timestamp
+             ON commands(command_hash, outcome, timestamp)",
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_commands_rule_outcome_timestamp
+             ON commands(rule_id, outcome, timestamp)
+             WHERE rule_id IS NOT NULL",
+        )?;
         Ok(())
     }
 
@@ -3823,6 +3903,16 @@ mod tests {
         assert!(indexes.iter().any(|i| i.contains("working_dir")));
         assert!(indexes.iter().any(|i| i.contains("pack_id")));
         assert!(indexes.iter().any(|i| i.contains("agent_type")));
+        assert!(
+            indexes
+                .iter()
+                .any(|i| i == "idx_commands_command_hash_outcome_timestamp")
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|i| i == "idx_commands_rule_outcome_timestamp")
+        );
     }
 
     #[test]
@@ -4205,6 +4295,122 @@ mod tests {
         }
 
         assert_eq!(db.count_commands().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_get_history_count_counts_recent_denies_across_sessions() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        let command = "git reset --hard HEAD~1";
+
+        for (idx, session_id) in ["session-a", "session-b"].iter().enumerate() {
+            let entry = CommandEntry {
+                timestamp: now - Duration::hours(i64::try_from(idx + 1).unwrap()),
+                agent_type: "codex".to_string(),
+                working_dir: "/project".to_string(),
+                command: command.to_string(),
+                outcome: Outcome::Deny,
+                session_id: Some((*session_id).to_string()),
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        let allowed_same_command = CommandEntry {
+            timestamp: now - Duration::minutes(30),
+            agent_type: "codex".to_string(),
+            working_dir: "/project".to_string(),
+            command: command.to_string(),
+            outcome: Outcome::Allow,
+            session_id: Some("session-c".to_string()),
+            ..Default::default()
+        };
+        db.log_command(&allowed_same_command).unwrap();
+
+        let old_block = CommandEntry {
+            timestamp: now - Duration::days(2),
+            agent_type: "codex".to_string(),
+            working_dir: "/project".to_string(),
+            command: command.to_string(),
+            outcome: Outcome::Deny,
+            session_id: Some("session-d".to_string()),
+            ..Default::default()
+        };
+        db.log_command(&old_block).unwrap();
+
+        let other_command = CommandEntry {
+            timestamp: now - Duration::hours(1),
+            agent_type: "codex".to_string(),
+            working_dir: "/project".to_string(),
+            command: "git reset --hard HEAD~2".to_string(),
+            outcome: Outcome::Deny,
+            session_id: Some("session-e".to_string()),
+            ..Default::default()
+        };
+        db.log_command(&other_command).unwrap();
+
+        assert_eq!(
+            db.get_history_count(command, Duration::hours(24)).unwrap(),
+            2
+        );
+        assert_eq!(
+            db.get_history_count("git clean -fd", Duration::hours(24))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_get_history_count_by_pattern_counts_recent_denies_only() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        insert_rule_entry(
+            &db,
+            "core.git:reset-hard",
+            Outcome::Deny,
+            now - Duration::hours(1),
+            "git reset --hard HEAD~1",
+        );
+        insert_rule_entry(
+            &db,
+            "core.git:reset-hard",
+            Outcome::Deny,
+            now - Duration::hours(2),
+            "git reset --hard HEAD~2",
+        );
+        insert_rule_entry(
+            &db,
+            "core.git:reset-hard",
+            Outcome::Warn,
+            now - Duration::hours(3),
+            "git reset --hard HEAD~3",
+        );
+        insert_rule_entry(
+            &db,
+            "core.git:reset-hard",
+            Outcome::Deny,
+            now - Duration::days(2),
+            "git reset --hard HEAD~4",
+        );
+        insert_rule_entry(
+            &db,
+            "core.git:force-push",
+            Outcome::Deny,
+            now - Duration::hours(1),
+            "git push --force",
+        );
+
+        assert_eq!(
+            db.get_history_count_by_pattern("core.git:reset-hard", Duration::hours(24))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.get_history_count_by_pattern("core.git:clean-force", Duration::hours(24))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
