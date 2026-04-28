@@ -804,10 +804,15 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
     i
 }
 
-/// Regex to strip absolute paths from git/rm binaries.
+/// Regex to strip absolute paths from git/rm/find binaries.
 ///
 /// Handles both Unix paths (`/path/to/bin/git`) and Windows paths (`C:/path/to/git.exe`).
 /// For Windows, matches drive letters (C:) followed by either forward or back slashes.
+///
+/// `find` is included so the `find -delete` family of destructive patterns
+/// catches path-prefixed invocations (`/usr/bin/find / -delete`). Without
+/// this, an agent could bypass the rule simply by writing the absolute
+/// path to find.
 pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"^(?:",
@@ -820,7 +825,7 @@ pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
         r"[A-Za-z]:[/\\](?:[^\s/\\]*[/\\])*",
         r")",
         // Capture the binary name
-        r"(rm|git)",
+        r"(rm|git|find)",
         // Optional .exe extension for Windows
         r"(?:\.exe)?",
         // Must be followed by whitespace or end
@@ -844,7 +849,7 @@ pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
 pub static QUOTED_PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
     // Matches quoted paths like "C:/Program Files/Git/bin/git.exe" or "/usr/bin/git"
     // Note: Uses [^"]+ to match path content (may include spaces)
-    Regex::new(r#"^"(?:[^"]+/|[A-Za-z]:[^"]+[/\\])(rm|git)(?:\.exe)?""#).unwrap()
+    Regex::new(r#"^"(?:[^"]+/|[A-Za-z]:[^"]+[/\\])(rm|git|find)(?:\.exe)?""#).unwrap()
 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

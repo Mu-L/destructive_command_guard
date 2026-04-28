@@ -623,21 +623,38 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         // `find ... -delete` safe whitelist for temp directories.
         //
-        // The destructive pattern `find-delete-general` (below) blocks any
-        // `find ... -delete` invocation, mirroring the `rm -rf` policy.
-        // These safe patterns short-circuit when EVERY path argument is
-        // rooted under the corresponding temp directory.
+        // WHOLE-COMMAND ANCHOR: `^...$`. The safe pattern only matches
+        // when the ENTIRE command is a single `find /tmp ... -delete`
+        // invocation. Compound forms (`find /tmp -delete; echo done`,
+        // `echo done; find /tmp -delete`, `(find /tmp -delete)`) do NOT
+        // short-circuit through the safe pattern.
         //
-        // STRICT shape: after `find <tmp-path>`, only allow more `<tmp-path>`
+        // The reason for whole-command anchoring: dcg's destructive
+        // evaluator (for non-rm patterns) matches against the whole
+        // sanitized command, not per-segment. If any safe pattern in the
+        // pack matches, ALL destructive patterns are skipped (see
+        // `evaluator.rs` `matches_safe_with_deadline` shadowing). A
+        // segment-aware safe pattern would create a real bypass:
+        //   find /tmp -delete; find /etc -delete
+        // — the first segment matches the safe pattern, the destructive
+        // pattern for the second segment is skipped, /etc is deleted.
+        //
+        // The trade-off is false positives on legitimate compound forms
+        // like `echo done; find /tmp -delete` (the destructive
+        // `find-delete-general` rule fires). Users can resolve via
+        // `dcg allow-once` for one-off cases or temporary allowlist for
+        // recurring scripts. Proper fix is a `parse_find_command`
+        // analogue to `parse_rm_command` that splits per-invocation —
+        // see git_safety_guard followup beads.
+        //
+        // STRICT shape: after `find <tmp-path>`, only allow more <tmp-path>
         // tokens or `-flag [value]` pairs whose value is NOT path-like
         // (i.e. doesn't start with `/`, `~`, or `$HOME`). This prevents
         //   find /tmp/foo /etc -delete
-        // (the previous loose pattern matched this and silently allowed
-        // the /etc deletion).
+        // from short-circuiting through (the `/etc` would also be deleted).
         //
-        // The `-delete` action must appear and the rest of the line must
-        // contain only flags. Trailing flags after `-delete` are also
-        // permitted (`-print -delete -prune` etc.).
+        // `-delete` must terminate the command (followed by end-of-string
+        // or only more non-path flags).
         // -----------------------------------------------------------------
         safe_pattern!(
             "find-delete-tmp",
@@ -789,14 +806,25 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // catastrophic root/home deletion is one Google search away from
         // useless.
         //
-        // The regex requires `find` at the start of the segment, then
-        // somewhere later a sensitive path token (root, common system
-        // dirs, or home-like prefixes) preceded by whitespace or `=`,
-        // then a `-delete` action flag terminated by whitespace or
-        // end-of-string (so `-delete-this-not-a-flag` does NOT match).
+        // The regex matches `find` at any word boundary (so it fires
+        // inside compound commands like `echo foo; find /etc -delete`,
+        // and on path-prefixed binaries like `/usr/bin/find / -delete`),
+        // then somewhere later a sensitive path token (root, common
+        // system dirs, or home-like prefixes) preceded by whitespace or
+        // `=`, then a `-delete` action flag terminated by whitespace,
+        // end-of-string, or a shell separator (`;`, `&`, `|`). The
+        // `(?:\s|$|[;&|])` end anchor — instead of `\b` — ensures
+        // `-delete-this-not-a-flag` does NOT false-positive (the `-`
+        // after `-delete` is not in our terminator set even though `\b`
+        // would happily allow it).
         destructive_pattern!(
             "find-delete-root-home",
-            r#"^\s*find\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$)"#,
+            // End anchor `(?:\s|$|[;&|)\n])` accepts shell separators,
+            // newlines, and a subshell-close `)` after `-delete` so
+            // `(find /etc -delete)` and `find /etc -delete | tee log`
+            // both fire. Without `)` in the set, subshell forms
+            // silently bypass.
+            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
             "find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed.",
             Critical,
             "`find <path> -delete` is the bytewise-equivalent of `rm -rf <path>`: \
@@ -822,11 +850,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // approval, exactly like the parallel `rm-rf-general` rule.
         destructive_pattern!(
             "find-delete-general",
-            // `-delete(?:\s|$)` (not `\b`) so that `-delete-this-not-a-flag`
-            // — where -delete is followed by another word character via `-`
-            // (which `\b` happily allows since `-` is non-word) — does NOT
-            // false-positive.
-            r"^\s*find\b[^|;&]*\s-delete(?:\s|$)",
+            // `\bfind\b` (not `^\s*find\b`) so the rule fires in compound
+            // forms (`echo foo; find . -delete`, `(find . -delete)`) and
+            // on path-prefixed binaries. `-delete(?:\s|$|[;&|)\n])` (not
+            // `\b`) so `-delete-this-not-a-flag` — where `\b` happily
+            // allows the following `-` — does NOT false-positive, while
+            // shell separators and subshell-close are still accepted.
+            r"\bfind\b[^|;&]*\s-delete(?:\s|$|[;&|)\n])",
             "find ... -delete is destructive (bytewise-equivalent to rm -rf on the matched tree) and requires human approval.",
             High,
             "`find ... -delete` recursively deletes every path matched by the find \
@@ -972,11 +1002,115 @@ mod tests {
             "find . -print",
             // -exec without rm is not destructive
             "find . -exec cat {} +",
-            // -delete is a SUBSTRING of -delete-this-arg; word boundary
-            // prevents false positive
+            // -delete is a SUBSTRING of -delete-this-arg; the explicit
+            // `(?:\s|$|[;&|])` terminator (instead of `\b`) prevents a
+            // false positive here.
             "find . -name -delete-this-not-a-flag",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn find_delete_blocks_in_compound_commands() {
+        let pack = create_pack();
+        // Regression: the original `^\s*find\b` anchor only matched at the
+        // start of the whole sanitized command. Compound forms like
+        //   echo foo; find /etc -delete
+        //   true && find / -delete
+        //   ; find /etc -delete
+        // dropped through entirely. Fixed by switching to `\bfind\b` so
+        // the destructive rule fires on the embedded `find` invocation.
+        for cmd in [
+            "true; find / -delete",
+            "echo done; find /etc -delete",
+            "true && find /etc -delete",
+            "false || find /etc -delete",
+            "(find /etc -delete)",
+            "find /tmp -delete; find /etc -delete", // 2nd segment dangerous
+        ] {
+            assert_blocks(&pack, cmd, "find");
+        }
+    }
+
+    #[test]
+    fn find_delete_blocks_with_terminating_separator() {
+        let pack = create_pack();
+        // `-delete;` and `-delete &&` and `-delete |` must terminate the
+        // -delete flag. The `(?:\s|$|[;&|])` end set allows shell
+        // separators, not just whitespace and end-of-string.
+        for cmd in [
+            "find /etc -delete; echo done",
+            "find /etc -delete && echo done",
+            "find /etc -delete | tee log",
+            "find /etc -delete&& echo done", // no space before &&
+        ] {
+            assert_blocks(&pack, cmd, "find");
+        }
+    }
+
+    #[test]
+    fn find_delete_path_prefixed_normalizes_to_bare_find() {
+        // PATH_NORMALIZER's capture group includes `find` so
+        // `/usr/bin/find / -delete` is normalized to `find / -delete`
+        // before the destructive regex runs. This test pins the
+        // normalizer contract — if `find` is dropped from the
+        // capture, this will fail and downstream pack matching will
+        // miss path-prefixed bypasses.
+        use crate::normalize::normalize_command;
+        for (input, expected_substring) in [
+            ("/usr/bin/find / -delete", "find / -delete"),
+            ("/usr/local/bin/find /etc -delete", "find /etc -delete"),
+            ("/bin/find /home -delete", "find /home -delete"),
+            ("/sbin/find /etc -delete", "find /etc -delete"),
+        ] {
+            let normalized = normalize_command(input);
+            assert!(
+                normalized.contains(expected_substring),
+                "PATH_NORMALIZER did not strip `{input}` to expected form `{expected_substring}` (got `{normalized}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn find_temp_compound_blocks_conservatively() {
+        let pack = create_pack();
+        // The safe pattern is whole-command anchored (`^...$`), NOT
+        // segment-aware. Compound forms with a temp `find -delete` are
+        // BLOCKED rather than allowed — this is a deliberate
+        // false-positive trade-off to prevent the bypass:
+        //   find /tmp -delete; find /etc -delete
+        // (a segment-aware safe would shadow the whole pack's destructive
+        // rules for the second segment, allowing /etc deletion).
+        //
+        // Users hitting this can `dcg allow-once <code>` for one-offs
+        // or add a temporary allowlist entry for recurring scripts.
+        for cmd in [
+            "echo done; find /tmp -delete",
+            "true && find /tmp -delete",
+            "echo done; find /tmp/foo -delete",
+            "echo done; find $TMPDIR -delete",
+        ] {
+            assert_blocks(&pack, cmd, "find");
+        }
+    }
+
+    #[test]
+    fn find_temp_safe_only_when_whole_command() {
+        let pack = create_pack();
+        // The safe pattern fires only on a clean, single-command
+        // invocation. This is the intended trade-off (see
+        // find_temp_compound_blocks_conservatively for rationale).
+        for cmd in [
+            "find /tmp -delete",
+            "find /tmp/foo -delete",
+            "find /tmp -name '*.log' -delete",
+            "find /tmp/foo -name '*.tmp' -delete",
+            "find /var/tmp -delete",
+            "find $TMPDIR -delete",
+            "find ${TMPDIR} -delete",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
         }
     }
 
