@@ -4945,6 +4945,69 @@ enabled = false
     }
 
     #[test]
+    fn test_git_awareness_protected_patterns_take_precedence_over_relaxed() {
+        let config = GitAwarenessConfig {
+            enabled: true,
+            protected_branches: vec!["release/*".to_string(), "*/hotfix".to_string()],
+            protected_strictness: StrictnessLevel::All,
+            relaxed_branches: vec!["release/beta".to_string(), "feature/*".to_string()],
+            relaxed_strictness: StrictnessLevel::Critical,
+            default_strictness: StrictnessLevel::Medium,
+            relaxed_disabled_packs: vec!["containers.docker".to_string()],
+            show_branch_in_output: true,
+            warn_if_not_git: false,
+        };
+
+        assert_eq!(
+            config.strictness_for_branch(Some("release/beta")),
+            StrictnessLevel::All
+        );
+        assert_eq!(
+            config.strictness_for_branch(Some("team/hotfix")),
+            StrictnessLevel::All
+        );
+        assert_eq!(
+            config.strictness_for_branch(Some("feature/demo")),
+            StrictnessLevel::Critical
+        );
+        assert_eq!(
+            config.strictness_for_branch(Some("develop")),
+            StrictnessLevel::Medium
+        );
+        assert_eq!(config.strictness_for_branch(None), StrictnessLevel::Medium);
+    }
+
+    #[test]
+    fn test_git_awareness_relaxed_disabled_packs_only_apply_to_relaxed_branches() {
+        let mut config = GitAwarenessConfig {
+            enabled: true,
+            protected_branches: vec!["main".to_string()],
+            protected_strictness: StrictnessLevel::All,
+            relaxed_branches: vec!["feature/*".to_string()],
+            relaxed_strictness: StrictnessLevel::Critical,
+            default_strictness: StrictnessLevel::High,
+            relaxed_disabled_packs: vec!["containers.docker".to_string(), "cloud.aws".to_string()],
+            show_branch_in_output: true,
+            warn_if_not_git: false,
+        };
+
+        assert_eq!(
+            config.disabled_packs_for_branch(Some("feature/local")),
+            &["containers.docker".to_string(), "cloud.aws".to_string()]
+        );
+        assert!(config.disabled_packs_for_branch(Some("main")).is_empty());
+        assert!(config.disabled_packs_for_branch(Some("develop")).is_empty());
+        assert!(config.disabled_packs_for_branch(None).is_empty());
+
+        config.enabled = false;
+        assert!(
+            config
+                .disabled_packs_for_branch(Some("feature/local"))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_heredoc_settings_defaults() {
         let config = Config::default();
         let settings = config.heredoc_settings();
