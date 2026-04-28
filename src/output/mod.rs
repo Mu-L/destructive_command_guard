@@ -25,6 +25,7 @@ pub mod console;
 pub mod denial;
 pub mod progress;
 pub mod rich_theme;
+pub mod suggestions;
 pub mod tables;
 pub mod test;
 pub mod theme;
@@ -39,6 +40,11 @@ pub use progress::{
 #[cfg(feature = "rich-output")]
 pub use progress::{RichProgressStyle, render_progress_bar_rich};
 pub use rich_theme::{RichThemeExt, color_to_markup, severity_badge_markup, severity_panel_title};
+pub use suggestions::{
+    SUGGESTION_OUTPUT_SCHEMA_VERSION, SuggestionJsonEntry, SuggestionJsonOutput,
+    SuggestionPathJson, SuggestionRenderOptions, render_suggestions_json, render_suggestions_text,
+    suggested_config_snippet, suggestions_to_json_output,
+};
 pub use tables::{ScanResultRow, ScanResultsTable, TableStyle};
 pub use test::{AllowedReason, TestOutcome, TestResultBox};
 pub use theme::{BorderStyle, Severity, SeverityColors, Theme, ThemePalette};
