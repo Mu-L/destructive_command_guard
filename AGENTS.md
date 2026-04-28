@@ -633,10 +633,16 @@ Runs format, clippy, UBS static analysis, and unit tests. Includes:
 
 ### Coverage Job
 
-Runs `cargo llvm-cov` and enforces thresholds:
+Runs `cargo llvm-cov` and enforces the thresholds configured in
+`.github/workflows/ci.yml` (`OVERALL_MIN`, `EVALUATOR_MIN`, `HOOK_MIN`).
+These are enforced gates, not aspirational targets:
 - **Overall:** >= 70%
-- **src/evaluator.rs:** >= 80%
-- **src/hook.rs:** >= 80%
+- **src/evaluator.rs:** >= 65%
+- **src/hook.rs:** >= 70%
+
+If CI thresholds change, update this section in the same change. The
+`coverage_threshold_docs` test checks that these documented values stay in sync
+with the workflow.
 
 Coverage is uploaded to Codecov for trend tracking. Dashboard: https://codecov.io/gh/Dicklesworthstone/destructive_command_guard
 

@@ -278,6 +278,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Keep in sync with AGENTS.md "Coverage Job"; the
+          # coverage_threshold_docs test checks these values.
           OVERALL_MIN="70.0"
           EVALUATOR_MIN="65.0"
           HOOK_MIN="70.0"
