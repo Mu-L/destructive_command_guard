@@ -1495,6 +1495,58 @@ mod tests {
     }
 
     #[test]
+    fn expired_project_rules_do_not_shadow_valid_user_rule() {
+        let rule = RuleId::parse("core.git:reset-hard").unwrap();
+
+        let project_toml = r#"
+            [[allow]]
+            rule = "core.git:reset-hard"
+            reason = "expired project reason"
+            expires_at = "2020-01-01T00:00:00Z"
+
+            [[allow]]
+            rule = "core.git:*"
+            reason = "expired project wildcard"
+            added_at = "2020-01-01T00:00:00Z"
+            ttl = "1h"
+        "#;
+        let user_toml = r#"
+            [[allow]]
+            rule = "core.git:reset-hard"
+            reason = "valid user reason"
+        "#;
+
+        let project_file =
+            parse_allowlist_toml(AllowlistLayer::Project, Path::new("project"), project_toml);
+        let user_file = parse_allowlist_toml(AllowlistLayer::User, Path::new("user"), user_toml);
+
+        let allowlists = LayeredAllowlist {
+            layers: vec![
+                LoadedAllowlistLayer {
+                    layer: AllowlistLayer::Project,
+                    path: PathBuf::from("project"),
+                    file: project_file,
+                },
+                LoadedAllowlistLayer {
+                    layer: AllowlistLayer::User,
+                    path: PathBuf::from("user"),
+                    file: user_file,
+                },
+            ],
+        };
+
+        let (entry, layer) = allowlists.lookup_rule(&rule).expect("must find user rule");
+        assert_eq!(layer, AllowlistLayer::User);
+        assert_eq!(entry.reason, "valid user reason");
+
+        let hit = allowlists
+            .match_rule("core.git", "reset-hard")
+            .expect("must find user rule");
+        assert_eq!(hit.layer, AllowlistLayer::User);
+        assert_eq!(hit.entry.reason, "valid user reason");
+    }
+
+    #[test]
     fn wildcard_pack_rule_matches_any_pattern_in_pack() {
         let allowlists = LayeredAllowlist {
             layers: vec![LoadedAllowlistLayer {
