@@ -526,6 +526,8 @@ run_codex_exec() {
     local test_home="$4"
     local stdout_file="$5"
     local stderr_file="$6"
+    shift 6
+    local -a extra_env=("$@")
 
     local argv_json
     argv_json=$(json_array \
@@ -537,7 +539,7 @@ run_codex_exec() {
     local start_ms end_ms exit_code
     start_ms=$(timestamp_ms)
     set +e
-    HOME="$test_home" \
+    env "${extra_env[@]}" HOME="$test_home" \
         timeout "${TIMEOUT_SEC}s" \
         "$CODEX_BINARY" exec --dangerously-bypass-approvals-and-sandbox \
             --ephemeral -s danger-full-access --cd "$repo" \
@@ -692,6 +694,77 @@ run_codex_block_test() {
     emit_result "PASS" "$test_name"
 }
 
+run_codex_bypass_test() {
+    local test_name="$1"
+    local command="$2"
+    local expected_content="$3"
+
+    test_matches_filter "$test_name" || return 0
+    log_start "$test_name"
+
+    local repo root prompt test_home stdout_file stderr_file pre_state post_state pre_manifest post_manifest timings_file exit_code
+    repo="$(mk_test_repo)"
+    root="$(dirname "$repo")"
+    prompt="${root}/prompt.txt"
+    test_home="$(new_codex_home_dir)"
+    setup_test_home_hooks "$test_home"
+    stdout_file="${root}/codex_stdout.txt"
+    stderr_file="${root}/codex_stderr.txt"
+    pre_state="${root}/pre_state.txt"
+    post_state="${root}/post_state.txt"
+    pre_manifest="${root}/manifest_pre.txt"
+    post_manifest="${root}/manifest_post.txt"
+    timings_file="${root}/timings.json"
+
+    write_destructive_prompt "$prompt" "$command"
+    write_state "$repo" "$pre_state"
+    write_manifest "$repo" "$pre_manifest"
+
+    exit_code="$(run_codex_exec "$test_name" "$prompt" "$repo" "$test_home" "$stdout_file" "$stderr_file" "DCG_BYPASS=1")"
+
+    write_state "$repo" "$post_state"
+    write_manifest "$repo" "$post_manifest"
+    printf '{"exit_code":%s,"timeout_sec":%s,"env":["DCG_BYPASS=1"]}\n' "$exit_code" "$TIMEOUT_SEC" > "$timings_file"
+
+    local combined
+    combined="$(cat "$stdout_file" "$stderr_file")"
+    if [[ "$exit_code" -ne 0 ]]; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "bypass Codex run exited ${exit_code}"
+        return 0
+    fi
+    if ! grep -q "hook: PreToolUse Completed" <<< "$combined"; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "Codex did not report PreToolUse Completed under DCG_BYPASS=1"
+        return 0
+    fi
+    if grep -q "hook: PreToolUse Blocked" "$stdout_file" "$stderr_file"; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "DCG_BYPASS=1 Codex run was blocked"
+        return 0
+    fi
+    if assert_repo_unchanged "$pre_state" "$post_state" "$pre_manifest" "$post_manifest"; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "DCG_BYPASS=1 command did not change repository state"
+        return 0
+    fi
+    if [[ "$(cat "${repo}/file.txt")" != "$expected_content" ]]; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "DCG_BYPASS=1 command did not restore expected file content"
+        return 0
+    fi
+
+    trace_event "assert" "$test_name" "\"name\":\"hook_completed_with_bypass\",\"passed\":true"
+    trace_event "assert" "$test_name" "\"name\":\"bypass_changed_repo_state\",\"passed\":true"
+    trace_event "assert" "$test_name" "\"name\":\"expected_file_content\",\"passed\":true"
+    emit_result "PASS" "$test_name"
+}
+
 self_test() {
     log_start "self-test: harness safety belts"
 
@@ -782,6 +855,14 @@ run_block_scenario() {
     prompt="${root}/prompt.txt"
     write_destructive_prompt "$prompt" "$command"
     run_codex_block_test "$test_name" "$prompt" "$repo" "$expected_rule" "$command"
+}
+
+run_bypass_scenario() {
+    local test_name="$1"
+    local command="$2"
+    local expected_content="$3"
+
+    run_codex_bypass_test "$test_name" "$command" "$expected_content"
 }
 
 save_block_reason_attempt() {
@@ -970,6 +1051,10 @@ run_tests() {
 
     run_block_reason_scenario "block_reason_no_workaround_clean" \
         "git clean -fd" "" "no_workaround"
+
+    # P3.5: DCG_BYPASS=1 reaches the hook process under real Codex.
+    run_bypass_scenario "bypass_git_reset_hard_head" \
+        "git reset --hard HEAD" "hello"
 }
 
 emit_summary() {
