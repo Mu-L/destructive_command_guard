@@ -10245,7 +10245,38 @@ fn handle_version_check(
 }
 
 fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    let script_url = "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh";
+    // Mitigation: pin the installer URL to a tag so the install.sh that
+    // runs is the one that shipped with the requested version (or with
+    // the currently-installed binary), rather than whatever is currently
+    // sitting on `main`. This bounds the trust window — `main` may be in
+    // mid-refactor or carry an in-flight installer change that does not
+    // belong in a stable update path. It does NOT eliminate the supply
+    // chain risk: a GitHub account compromise still lets an attacker push
+    // arbitrary code at the chosen tag. Proper mitigation requires
+    // verifying install.sh against a sha256 / sigstore bundle published
+    // with each release — see follow-up bd issue.
+    let target_tag = update
+        .version
+        .clone()
+        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+    let normalized_tag = if target_tag.starts_with('v') {
+        target_tag.clone()
+    } else {
+        format!("v{target_tag}")
+    };
+    let script_url = format!(
+        "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.sh"
+    );
+
+    eprintln!("WARNING: dcg update fetches install.sh from {normalized_tag} and pipes it to bash.");
+    eprintln!(
+        "         The script itself verifies the binary checksum and (optionally) the sigstore bundle,"
+    );
+    eprintln!("         but install.sh itself is not yet checksum-verified. If you need stronger");
+    eprintln!(
+        "         supply-chain guarantees for the script, install manually from a release tarball."
+    );
+
     let mut args: Vec<String> = Vec::new();
 
     if let Some(version) = update.version {
@@ -10290,11 +10321,14 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     }
 
     let command = if escaped_args.is_empty() {
-        format!("curl -fsSL {} | bash -s --", shell_escape_posix(script_url))
+        format!(
+            "curl -fsSL {} | bash -s --",
+            shell_escape_posix(&script_url)
+        )
     } else {
         format!(
             "curl -fsSL {} | bash -s -- {}",
-            shell_escape_posix(script_url),
+            shell_escape_posix(&script_url),
             escaped_args
         )
     };
@@ -10324,7 +10358,32 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
         );
     }
 
-    let script_url = "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1";
+    // Same tag-pinning mitigation as `self_update_unix`. See the comment
+    // there for the full rationale and the follow-up issue tracking
+    // proper installer signing.
+    let target_tag = update
+        .version
+        .clone()
+        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+    let normalized_tag = if target_tag.starts_with('v') {
+        target_tag.clone()
+    } else {
+        format!("v{target_tag}")
+    };
+    let script_url = format!(
+        "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.ps1"
+    );
+
+    eprintln!(
+        "WARNING: dcg update fetches install.ps1 from {normalized_tag} and runs it in PowerShell."
+    );
+    eprintln!(
+        "         install.ps1 verifies the binary, but the script itself is not yet checksum-verified."
+    );
+    eprintln!(
+        "         For stronger supply-chain guarantees, install manually from a release archive."
+    );
+
     let mut args: Vec<String> = Vec::new();
 
     if let Some(version) = update.version {
@@ -10358,7 +10417,7 @@ Invoke-WebRequest -Uri $url -OutFile $tmp; \
 $code=$LASTEXITCODE; \
 Remove-Item $tmp -ErrorAction SilentlyContinue; \
 exit $code;",
-        url = shell_escape_powershell(script_url),
+        url = shell_escape_powershell(&script_url),
         args = args_str
     );
 
@@ -15755,6 +15814,80 @@ exclude = ["target/**"]
         let contains_diff = paths.iter().any(|p| p.to_string_lossy() == "diff.rs");
 
         assert!(contains_diff);
+    }
+
+    #[test]
+    fn git_diff_rejects_flag_like_rev_range() {
+        // Regression: --git-diff used to forward its argument to `git diff`
+        // with no validation. Values starting with `-` were interpreted
+        // as flags, including dangerous ones like `--output=/etc/...`
+        // (overwrites the file with diff content) and `--ext-diff`
+        // (activates external diff drivers from .git/config).
+        let bad_inputs = [
+            "--output=/etc/passwd",
+            "--ext-diff",
+            "--upload-pack=evil",
+            "-",
+            "--no-renames",
+        ];
+        for bad in bad_inputs {
+            let err = validate_git_rev_range(bad).expect_err(&format!(
+                "validate_git_rev_range({bad:?}) should reject flag-like input"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("'-'") || msg.contains("disallowed"),
+                "expected flag rejection message, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_diff_rejects_shell_metacharacters() {
+        // Defense in depth: even if downstream callers ever interpolate
+        // rev_range into a shell string, we reject the chars that would
+        // matter.
+        let bad_inputs = [
+            "main; rm -rf /",
+            "HEAD && echo pwned",
+            "HEAD | curl evil",
+            "HEAD\nrm -rf /",
+            "$(echo evil)",
+            "`evil`",
+            "main\0HEAD",
+        ];
+        for bad in bad_inputs {
+            assert!(
+                validate_git_rev_range(bad).is_err(),
+                "validate_git_rev_range({bad:?}) should reject shell metacharacter"
+            );
+        }
+    }
+
+    #[test]
+    fn git_diff_accepts_legitimate_rev_ranges() {
+        // Real git rev-ranges that should pass through unchanged.
+        let good_inputs = [
+            "HEAD",
+            "HEAD~3..HEAD",
+            "main..feature",
+            "release/1.0..HEAD",
+            "v1.2.3...v2.0",
+            "HEAD@{1}",
+            "abc1234",
+            "abc1234..def5678",
+        ];
+        for good in good_inputs {
+            assert!(
+                validate_git_rev_range(good).is_ok(),
+                "validate_git_rev_range({good:?}) should accept legitimate input"
+            );
+        }
+    }
+
+    #[test]
+    fn git_diff_rejects_empty() {
+        assert!(validate_git_rev_range("").is_err());
     }
 
     // ========================================================================
