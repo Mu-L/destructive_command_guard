@@ -211,6 +211,8 @@ struct GitAwarenessConfigLayer {
     relaxed_branches: Option<Vec<String>>,
     relaxed_strictness: Option<StrictnessLevel>,
     default_strictness: Option<StrictnessLevel>,
+    relaxed_disabled_packs: Option<Vec<String>>,
+    show_branch_in_output: Option<bool>,
     warn_if_not_git: Option<bool>,
 }
 
@@ -1717,7 +1719,7 @@ impl Default for HistoryConfig {
 /// ```toml
 /// [git_awareness]
 /// enabled = true
-/// protected_branches = ["main", "master", "production", "release/*"]
+/// protected_branches = ["main", "production", "release/*"]
 /// protected_strictness = "all"
 /// relaxed_branches = ["feature/*", "experiment/*", "sandbox/*"]
 /// relaxed_strictness = "critical"
@@ -1797,7 +1799,7 @@ impl std::fmt::Display for StrictnessLevel {
 /// enabled = true
 ///
 /// # Protected branches get extra scrutiny
-/// protected_branches = ["main", "master", "production", "release/*"]
+/// protected_branches = ["main", "production", "release/*"]
 /// protected_strictness = "all"  # Block everything including Low severity
 ///
 /// # Feature branches get more freedom
@@ -1864,7 +1866,6 @@ impl Default for GitAwarenessConfig {
             enabled: false,
             protected_branches: vec![
                 "main".to_string(),
-                "master".to_string(),
                 "production".to_string(),
                 "release/*".to_string(),
             ],
@@ -2896,6 +2897,12 @@ impl Config {
         if let Some(default_strictness) = git_awareness.default_strictness {
             self.git_awareness.default_strictness = default_strictness;
         }
+        if let Some(relaxed_disabled_packs) = git_awareness.relaxed_disabled_packs {
+            self.git_awareness.relaxed_disabled_packs = relaxed_disabled_packs;
+        }
+        if let Some(show_branch_in_output) = git_awareness.show_branch_in_output {
+            self.git_awareness.show_branch_in_output = show_branch_in_output;
+        }
         if let Some(warn_if_not_git) = git_awareness.warn_if_not_git {
             self.git_awareness.warn_if_not_git = warn_if_not_git;
         }
@@ -3066,7 +3073,7 @@ impl Config {
             }
         }
 
-        // DCG_GIT_PROTECTED_BRANCHES=main,master,production
+        // DCG_GIT_PROTECTED_BRANCHES=main,production,release/*
         if let Some(branches) = get_env(&format!("{ENV_PREFIX}_GIT_PROTECTED_BRANCHES")) {
             let parsed: Vec<String> = branches
                 .split(',')
@@ -3108,6 +3115,23 @@ impl Config {
         if let Some(strictness) = get_env(&format!("{ENV_PREFIX}_GIT_DEFAULT_STRICTNESS")) {
             if let Some(parsed) = StrictnessLevel::from_str_case_insensitive(&strictness) {
                 self.git_awareness.default_strictness = parsed;
+            }
+        }
+
+        // DCG_GIT_RELAXED_DISABLED_PACKS=containers.docker,cloud.aws
+        if let Some(packs) = get_env(&format!("{ENV_PREFIX}_GIT_RELAXED_DISABLED_PACKS")) {
+            let parsed: Vec<String> = packs
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            self.git_awareness.relaxed_disabled_packs = parsed;
+        }
+
+        // DCG_GIT_SHOW_BRANCH_IN_OUTPUT=true|false|1|0
+        if let Some(show) = get_env(&format!("{ENV_PREFIX}_GIT_SHOW_BRANCH_IN_OUTPUT")) {
+            if let Some(parsed) = parse_env_bool(&show) {
+                self.git_awareness.show_branch_in_output = parsed;
             }
         }
 
@@ -3440,6 +3464,34 @@ custom_paths = [
 # Safety: Critical rules are only loosened via explicit per-rule overrides.
 
 #─────────────────────────────────────────────────────────────
+# GIT BRANCH AWARENESS
+#─────────────────────────────────────────────────────────────
+
+[git_awareness]
+# Enable branch-aware strictness.
+enabled = false
+
+# Branches that receive extra protection.
+protected_branches = ["main", "production", "release/*"]
+protected_strictness = "all"
+
+# Branches that can use a lower strictness level.
+relaxed_branches = ["feature/*", "experiment/*", "sandbox/*"]
+relaxed_strictness = "critical"
+
+# Strictness when no branch pattern matches.
+default_strictness = "high"
+
+# Packs to disable only on relaxed branches.
+relaxed_disabled_packs = []
+
+# Include branch context in human-facing output.
+show_branch_in_output = true
+
+# Warn when git awareness is enabled outside a git repository.
+warn_if_not_git = false
+
+#─────────────────────────────────────────────────────────────
 # CUSTOM OVERRIDES
 #─────────────────────────────────────────────────────────────
 
@@ -3727,9 +3779,8 @@ auto_prune_expired = true
     #[test]
     fn test_sample_config_parses() {
         let sample = Config::generate_sample_config();
-        // Remove comment lines for parsing test
-        let _config: Result<Config, _> = toml::from_str(&sample);
-        // Note: The sample has comments which toml handles fine
+        assert!(sample.contains("[git_awareness]"));
+        toml::from_str::<Config>(&sample).expect("sample config parses");
     }
 
     #[test]
@@ -4493,6 +4544,238 @@ enabled = false
         assert!(!config.interactive.allow_non_tty_fallback);
         assert!(!config.interactive.disable_in_ci);
         assert_eq!(config.interactive.require_env.as_deref(), Some("KEEP_ME"));
+    }
+
+    #[test]
+    fn test_git_awareness_defaults_match_schema() {
+        let config = GitAwarenessConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(
+            config.protected_branches,
+            vec![
+                "main".to_string(),
+                "production".to_string(),
+                "release/*".to_string()
+            ]
+        );
+        assert_eq!(config.protected_strictness, StrictnessLevel::All);
+        assert_eq!(
+            config.relaxed_branches,
+            vec![
+                "feature/*".to_string(),
+                "experiment/*".to_string(),
+                "sandbox/*".to_string()
+            ]
+        );
+        assert_eq!(config.relaxed_strictness, StrictnessLevel::Critical);
+        assert_eq!(config.default_strictness, StrictnessLevel::High);
+        assert!(config.relaxed_disabled_packs.is_empty());
+        assert!(config.show_branch_in_output);
+        assert!(!config.warn_if_not_git);
+    }
+
+    #[test]
+    fn test_git_awareness_config_from_toml() {
+        let input = r#"
+[git_awareness]
+enabled = true
+protected_branches = ["main", "production", "release/*"]
+protected_strictness = "all"
+relaxed_branches = ["feature/*", "sandbox/*"]
+relaxed_strictness = "critical"
+default_strictness = "medium"
+relaxed_disabled_packs = ["containers.docker", "cloud.aws"]
+show_branch_in_output = false
+warn_if_not_git = true
+"#;
+        let config: Config = toml::from_str(input).expect("config parses");
+
+        assert!(config.git_awareness.enabled);
+        assert_eq!(
+            config.git_awareness.protected_branches,
+            vec![
+                "main".to_string(),
+                "production".to_string(),
+                "release/*".to_string()
+            ]
+        );
+        assert_eq!(
+            config.git_awareness.protected_strictness,
+            StrictnessLevel::All
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_branches,
+            vec!["feature/*".to_string(), "sandbox/*".to_string()]
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_strictness,
+            StrictnessLevel::Critical
+        );
+        assert_eq!(
+            config.git_awareness.default_strictness,
+            StrictnessLevel::Medium
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_disabled_packs,
+            vec!["containers.docker".to_string(), "cloud.aws".to_string()]
+        );
+        assert!(!config.git_awareness.should_show_branch_in_output());
+        assert!(config.git_awareness.warn_if_not_git);
+    }
+
+    #[test]
+    fn test_config_merge_layer_git_awareness_overrides_all_fields() {
+        let mut config = Config::default();
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[git_awareness]
+enabled = true
+protected_branches = ["main", "production"]
+protected_strictness = "all"
+relaxed_branches = ["feature/*"]
+relaxed_strictness = "critical"
+default_strictness = "medium"
+relaxed_disabled_packs = ["containers.docker"]
+show_branch_in_output = false
+warn_if_not_git = true
+"#,
+        )
+        .expect("layer parses");
+
+        config.merge_layer(layer);
+
+        assert!(config.git_awareness.enabled);
+        assert_eq!(
+            config.git_awareness.protected_branches,
+            vec!["main".to_string(), "production".to_string()]
+        );
+        assert_eq!(
+            config.git_awareness.protected_strictness,
+            StrictnessLevel::All
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_branches,
+            vec!["feature/*".to_string()]
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_strictness,
+            StrictnessLevel::Critical
+        );
+        assert_eq!(
+            config.git_awareness.default_strictness,
+            StrictnessLevel::Medium
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_disabled_packs,
+            vec!["containers.docker".to_string()]
+        );
+        assert!(!config.git_awareness.show_branch_in_output);
+        assert!(config.git_awareness.warn_if_not_git);
+    }
+
+    #[test]
+    fn test_config_merge_layer_git_awareness_missing_fields_do_not_override() {
+        let mut config = Config::default();
+        config.git_awareness.enabled = true;
+        config.git_awareness.protected_branches = vec!["production".to_string()];
+        config.git_awareness.protected_strictness = StrictnessLevel::All;
+        config.git_awareness.relaxed_branches = vec!["sandbox/*".to_string()];
+        config.git_awareness.relaxed_strictness = StrictnessLevel::Critical;
+        config.git_awareness.default_strictness = StrictnessLevel::Medium;
+        config.git_awareness.relaxed_disabled_packs = vec!["cloud.aws".to_string()];
+        config.git_awareness.show_branch_in_output = false;
+        config.git_awareness.warn_if_not_git = true;
+
+        let layer: ConfigLayer = toml::from_str(
+            r"
+[git_awareness]
+enabled = false
+",
+        )
+        .expect("layer parses");
+
+        config.merge_layer(layer);
+
+        assert!(!config.git_awareness.enabled);
+        assert_eq!(
+            config.git_awareness.protected_branches,
+            vec!["production".to_string()]
+        );
+        assert_eq!(
+            config.git_awareness.protected_strictness,
+            StrictnessLevel::All
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_branches,
+            vec!["sandbox/*".to_string()]
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_strictness,
+            StrictnessLevel::Critical
+        );
+        assert_eq!(
+            config.git_awareness.default_strictness,
+            StrictnessLevel::Medium
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_disabled_packs,
+            vec!["cloud.aws".to_string()]
+        );
+        assert!(!config.git_awareness.show_branch_in_output);
+        assert!(config.git_awareness.warn_if_not_git);
+    }
+
+    #[test]
+    fn test_git_awareness_env_overrides() {
+        let env_map: std::collections::HashMap<&str, &str> = std::collections::HashMap::from([
+            ("DCG_GIT_AWARENESS_ENABLED", "true"),
+            ("DCG_GIT_PROTECTED_BRANCHES", "main, production, release/*"),
+            ("DCG_GIT_PROTECTED_STRICTNESS", "all"),
+            ("DCG_GIT_RELAXED_BRANCHES", "feature/*, sandbox/*"),
+            ("DCG_GIT_RELAXED_STRICTNESS", "critical"),
+            ("DCG_GIT_DEFAULT_STRICTNESS", "medium"),
+            (
+                "DCG_GIT_RELAXED_DISABLED_PACKS",
+                "containers.docker, cloud.aws",
+            ),
+            ("DCG_GIT_SHOW_BRANCH_IN_OUTPUT", "false"),
+            ("DCG_GIT_AWARENESS_WARN_IF_NOT_GIT", "true"),
+        ]);
+        let mut config = Config::default();
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+
+        assert!(config.git_awareness.enabled);
+        assert_eq!(
+            config.git_awareness.protected_branches,
+            vec![
+                "main".to_string(),
+                "production".to_string(),
+                "release/*".to_string()
+            ]
+        );
+        assert_eq!(
+            config.git_awareness.protected_strictness,
+            StrictnessLevel::All
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_branches,
+            vec!["feature/*".to_string(), "sandbox/*".to_string()]
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_strictness,
+            StrictnessLevel::Critical
+        );
+        assert_eq!(
+            config.git_awareness.default_strictness,
+            StrictnessLevel::Medium
+        );
+        assert_eq!(
+            config.git_awareness.relaxed_disabled_packs,
+            vec!["containers.docker".to_string(), "cloud.aws".to_string()]
+        );
+        assert!(!config.git_awareness.show_branch_in_output);
+        assert!(config.git_awareness.warn_if_not_git);
     }
 
     #[test]
