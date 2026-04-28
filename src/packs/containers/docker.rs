@@ -503,4 +503,57 @@ mod tests {
         assert_allows(&pack, "docker logs mycontainer");
         assert_allows(&pack, "docker build -t app .");
     }
+
+    #[test]
+    fn docker_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks(&pack, "docker system prune", "prune");
+        assert_blocks(&pack, "docker system prune --all", "prune");
+        assert_blocks(&pack, "docker volume prune", "prune");
+        assert_blocks(&pack, "docker network prune", "prune");
+        assert_blocks(&pack, "docker image prune", "prune");
+        assert_blocks(&pack, "docker container prune", "prune");
+        assert_blocks(&pack, "docker volume rm my-volume", "volume");
+        assert_blocks(
+            &pack,
+            "docker stop $(docker ps -aq)",
+            "stop",
+        );
+    }
+
+    #[test]
+    fn docker_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "docker system prune -a", Severity::Critical);
+        assert_blocks_with_severity(&pack, "docker volume prune", Severity::Critical);
+        assert_blocks_with_severity(&pack, "docker volume rm data-vol", Severity::High);
+        assert_blocks_with_severity(&pack, "docker rm -f container", Severity::High);
+        assert_blocks_with_severity(&pack, "docker rmi -f image", Severity::High);
+    }
+
+    #[test]
+    fn docker_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "docker ps");
+        assert_safe_pattern_matches(&pack, "docker ps -a");
+        assert_safe_pattern_matches(&pack, "docker logs mycontainer");
+        assert_safe_pattern_matches(&pack, "docker images");
+        assert_safe_pattern_matches(&pack, "docker inspect mycontainer");
+        assert_safe_pattern_matches(&pack, "docker build -t app .");
+        assert_safe_pattern_matches(&pack, "docker pull nginx:latest");
+        assert_safe_pattern_matches(&pack, "docker run --rm hello-world");
+        assert_safe_pattern_matches(&pack, "docker exec -it container bash");
+        assert_safe_pattern_matches(&pack, "docker network ls");
+        assert_safe_pattern_matches(&pack, "docker volume ls");
+        assert_safe_pattern_matches(&pack, "docker info");
+        assert_safe_pattern_matches(&pack, "docker version");
+    }
+
+    #[test]
+    fn docker_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "ls -la");
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo docker");
+    }
 }
