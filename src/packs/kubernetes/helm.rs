@@ -204,4 +204,78 @@ mod tests {
         assert_allows(&pack, "helm get values prod-release");
         assert_allows(&pack, "helm status prod-release");
     }
+
+    #[test]
+    fn helm_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks(&pack, "helm uninstall my-release", "uninstall");
+        assert_blocks(&pack, "helm delete my-release", "uninstall");
+        assert_blocks(&pack, "helm rollback my-release 3", "rollback");
+        assert_blocks(
+            &pack,
+            "helm upgrade my-release ./chart --force",
+            "force",
+        );
+        assert_blocks(
+            &pack,
+            "helm upgrade my-release ./chart --reset-values",
+            "reset-values",
+        );
+    }
+
+    #[test]
+    fn helm_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(
+            &pack,
+            "helm uninstall prod-release",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "helm rollback prod-release 2",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "helm upgrade prod-release ./chart --force",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "helm upgrade prod-release ./chart --reset-values",
+            Severity::High,
+        );
+    }
+
+    #[test]
+    fn helm_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "helm list");
+        assert_safe_pattern_matches(&pack, "helm status my-release");
+        assert_safe_pattern_matches(&pack, "helm history my-release");
+        assert_safe_pattern_matches(&pack, "helm show chart stable/nginx");
+        assert_safe_pattern_matches(&pack, "helm inspect values stable/nginx");
+        assert_safe_pattern_matches(&pack, "helm get all my-release");
+        assert_safe_pattern_matches(&pack, "helm search repo nginx");
+        assert_safe_pattern_matches(&pack, "helm repo list");
+        assert_safe_pattern_matches(&pack, "helm template my-release ./chart");
+        assert_safe_pattern_matches(&pack, "helm lint ./chart");
+        assert_safe_pattern_matches(&pack, "helm diff upgrade my-release ./chart");
+    }
+
+    #[test]
+    fn helm_dry_run_overrides_destructive() {
+        let pack = create_pack();
+        assert_allows(&pack, "helm uninstall my-release --dry-run");
+        assert_allows(&pack, "helm rollback my-release 3 --dry-run");
+    }
+
+    #[test]
+    fn helm_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "ls -la");
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo helm");
+    }
 }
