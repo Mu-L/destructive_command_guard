@@ -14,6 +14,8 @@ use rich_rust::renderables::tree::{Tree as RichTree, TreeGuides, TreeNode as Ric
 use rich_rust::style::Style;
 
 use super::theme::{BorderStyle, Theme};
+use crate::evaluator::EvaluationDecision;
+use crate::trace::{ExplainTrace, MatchInfo, PackSummary, TraceDetails, TraceStep};
 
 /// Guide style for tree rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -451,9 +453,343 @@ impl ExplainTreeBuilder {
     }
 }
 
+/// Build the rich/plain tree used by `dcg explain`.
+#[must_use]
+pub fn explain_trace_tree(trace: &ExplainTrace) -> DcgTree {
+    let mut root = TreeNode::new("DCG EXPLAIN")
+        .child(decision_node(trace))
+        .child(command_node(trace));
+
+    if let Some(info) = trace.match_info.as_ref() {
+        root = root.child(match_node(info));
+    }
+
+    if let Some(info) = trace.allowlist_info.as_ref() {
+        root = root.child(
+            TreeNode::new("Allowlist Override")
+                .styled("[bold green]")
+                .child(TreeNode::new(format!("Layer: {:?}", info.layer)))
+                .child(TreeNode::new(format!("Reason: {}", info.entry_reason)))
+                .child(TreeNode::new(format!(
+                    "Overrode: {} - {}",
+                    info.original_match.rule_id.as_deref().unwrap_or("unknown"),
+                    info.original_match.reason
+                ))),
+        );
+    }
+
+    if let Some(summary) = trace.pack_summary.as_ref() {
+        root = root.child(pack_summary_node(summary));
+    }
+
+    if !trace.steps.is_empty() {
+        root = root.child(pipeline_node(&trace.steps));
+    }
+
+    if trace.skipped_due_to_budget {
+        root = root.child(
+            TreeNode::new("Budget")
+                .styled("[bold yellow]")
+                .child(TreeNode::new(
+                    "Skipped deeper analysis after budget exhaustion",
+                )),
+        );
+    }
+
+    if let Some(node) = suggestions_node(trace) {
+        root = root.child(node);
+    }
+
+    DcgTree::new(root)
+}
+
+fn decision_node(trace: &ExplainTrace) -> TreeNode {
+    let (decision, style) = match trace.decision {
+        EvaluationDecision::Allow => ("ALLOW", "[bold green]"),
+        EvaluationDecision::Deny => ("DENY", "[bold red]"),
+    };
+
+    TreeNode::new(format!("Decision: {decision}"))
+        .styled(style)
+        .child(TreeNode::new(format!(
+            "Latency: {:.2}ms",
+            trace.total_duration_us as f64 / 1000.0
+        )))
+}
+
+fn command_node(trace: &ExplainTrace) -> TreeNode {
+    let has_normalized = trace
+        .normalized_command
+        .as_ref()
+        .is_some_and(|normalized| normalized != &trace.command);
+    let has_sanitized = trace.sanitized_command.as_ref().is_some_and(|sanitized| {
+        sanitized != &trace.command && Some(sanitized) != trace.normalized_command.as_ref()
+    });
+
+    let mut node = TreeNode::new("Command")
+        .styled("[bold cyan]")
+        .child(TreeNode::new(format!("Input: {}", trace.command)));
+
+    if has_normalized {
+        if let Some(normalized) = trace.normalized_command.as_ref() {
+            node = node.child(TreeNode::new(format!("Normalized: {normalized}")));
+        }
+    }
+
+    if has_sanitized {
+        if let Some(sanitized) = trace.sanitized_command.as_ref() {
+            node = node.child(TreeNode::new(format!("Sanitized: {sanitized}")));
+        }
+    }
+
+    node
+}
+
+fn match_node(info: &MatchInfo) -> TreeNode {
+    let mut children = Vec::new();
+
+    if let Some(rule_id) = info.rule_id.as_ref() {
+        children.push(TreeNode::new(format!("Rule ID: {rule_id}")));
+    }
+    if let Some(pack_id) = info.pack_id.as_ref() {
+        children.push(TreeNode::new(format!("Pack: {pack_id}")));
+    }
+    if let Some(pattern) = info.pattern_name.as_ref() {
+        children.push(TreeNode::new(format!("Pattern: {pattern}")));
+    }
+    if let Some(severity) = info.severity {
+        children.push(TreeNode::new(format!("Severity: {severity:?}")));
+    }
+    children.push(TreeNode::new(format!("Source: {:?}", info.source)));
+    children.push(TreeNode::new(format!("Reason: {}", info.reason)));
+
+    if let (Some(start), Some(end)) = (info.match_start, info.match_end) {
+        children.push(TreeNode::new(format!("Span: bytes {start}..{end}")));
+    }
+    if let Some(preview) = info.matched_text_preview.as_ref() {
+        children.push(TreeNode::new(format!("Matched: {preview}")));
+    }
+    if let Some(explanation) = info.explanation.as_ref() {
+        children.push(
+            TreeNode::new("Explanation").children(
+                explanation
+                    .lines()
+                    .map(|line| TreeNode::new(line.trim().to_string())),
+            ),
+        );
+    }
+
+    TreeNode::new("Match")
+        .styled("[bold yellow]")
+        .children(children)
+}
+
+fn pack_summary_node(summary: &PackSummary) -> TreeNode {
+    let mut node = TreeNode::new("Packs")
+        .styled("[bold magenta]")
+        .child(TreeNode::new(format!(
+            "Enabled: {} packs",
+            summary.enabled_count
+        )));
+
+    if !summary.evaluated.is_empty() {
+        node = node.child(TreeNode::new(format!(
+            "Evaluated: {}",
+            summary.evaluated.join(", ")
+        )));
+    }
+
+    if !summary.skipped.is_empty() {
+        node = node.child(TreeNode::new(format!(
+            "Skipped (keyword gating): {}",
+            summary.skipped.join(", ")
+        )));
+    }
+
+    node
+}
+
+fn pipeline_node(steps: &[TraceStep]) -> TreeNode {
+    TreeNode::new("Pipeline Trace")
+        .styled("[bold blue]")
+        .children(steps.iter().map(trace_step_node))
+}
+
+fn trace_step_node(step: &TraceStep) -> TreeNode {
+    let summary = trace_details_summary(&step.details);
+    let mut node = TreeNode::new(format!(
+        "{} ({:.2}ms)",
+        step.name,
+        step.duration_us as f64 / 1000.0
+    ));
+
+    if !summary.is_empty() {
+        node = node.child(TreeNode::new(summary));
+    }
+
+    node
+}
+
+fn trace_details_summary(details: &TraceDetails) -> String {
+    match details {
+        TraceDetails::InputParsing {
+            is_hook_input,
+            command_len,
+        } => format!("hook input: {is_hook_input}, command bytes: {command_len}"),
+        TraceDetails::KeywordGating {
+            quick_rejected,
+            keywords_checked,
+            first_match,
+        } => {
+            if *quick_rejected {
+                format!("quick pass after {} keyword checks", keywords_checked.len())
+            } else if let Some(keyword) = first_match {
+                format!("matched: {keyword}")
+            } else {
+                format!("no match after {} keyword checks", keywords_checked.len())
+            }
+        }
+        TraceDetails::Normalization {
+            was_modified,
+            stripped_prefix,
+        } => {
+            if *was_modified {
+                stripped_prefix.as_ref().map_or_else(
+                    || "modified".to_string(),
+                    |prefix| format!("stripped prefix: {prefix}"),
+                )
+            } else {
+                "unchanged".to_string()
+            }
+        }
+        TraceDetails::Sanitization {
+            was_modified,
+            spans_masked,
+        } => {
+            if *was_modified {
+                format!("{spans_masked} spans masked")
+            } else {
+                "unchanged".to_string()
+            }
+        }
+        TraceDetails::HeredocDetection {
+            triggered,
+            scripts_extracted,
+            languages,
+        } => {
+            if *triggered {
+                let suffix = if languages.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", languages.join(", "))
+                };
+                format!("{scripts_extracted} scripts{suffix}")
+            } else {
+                "none".to_string()
+            }
+        }
+        TraceDetails::AllowlistCheck {
+            layers_checked,
+            matched,
+            matched_layer,
+        } => {
+            if *matched {
+                matched_layer.as_ref().map_or_else(
+                    || format!("matched after {layers_checked} layers"),
+                    |layer| format!("matched {layer:?} after {layers_checked} layers"),
+                )
+            } else {
+                format!("no match after {layers_checked} layers")
+            }
+        }
+        TraceDetails::PackEvaluation {
+            packs_evaluated,
+            packs_skipped,
+            matched_pack,
+            matched_pattern,
+        } => {
+            if let Some(pack) = matched_pack {
+                matched_pattern.as_ref().map_or_else(
+                    || format!("matched in {pack}"),
+                    |pattern| format!("matched {pack}:{pattern}"),
+                )
+            } else {
+                format!(
+                    "{} packs checked, {} skipped",
+                    packs_evaluated.len(),
+                    packs_skipped.len()
+                )
+            }
+        }
+        TraceDetails::ConfigOverride {
+            allow_matched,
+            block_matched,
+            reason,
+        } => {
+            if *allow_matched {
+                "allow override matched".to_string()
+            } else if *block_matched {
+                reason.as_ref().map_or_else(
+                    || "block override matched".to_string(),
+                    |reason| format!("block override: {reason}"),
+                )
+            } else {
+                "no override".to_string()
+            }
+        }
+        TraceDetails::PolicyDecision {
+            decision,
+            allowlisted,
+        } => {
+            let decision = match decision {
+                EvaluationDecision::Allow => "allow",
+                EvaluationDecision::Deny => "deny",
+            };
+            if *allowlisted {
+                format!("{decision} via allowlist")
+            } else {
+                decision.to_string()
+            }
+        }
+    }
+}
+
+fn suggestions_node(trace: &ExplainTrace) -> Option<TreeNode> {
+    if !crate::output::suggestions_enabled() {
+        return None;
+    }
+
+    let rule_id = trace.match_info.as_ref()?.rule_id.as_deref()?;
+    let suggestions = crate::suggestions::get_suggestions(rule_id)?;
+    if suggestions.is_empty() {
+        return None;
+    }
+
+    Some(
+        TreeNode::new("Suggestions")
+            .styled("[bold yellow]")
+            .children(suggestions.iter().map(|suggestion| {
+                let mut node =
+                    TreeNode::new(format!("{}: {}", suggestion.kind.label(), suggestion.text));
+
+                if let Some(command) = suggestion.command.as_ref() {
+                    node = node.child(TreeNode::new(format!("$ {command}")));
+                }
+                if let Some(url) = suggestion.url.as_ref() {
+                    node = node.child(TreeNode::new(format!("See: {url}")));
+                }
+
+                node
+            })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evaluator::MatchSource;
+    use crate::packs::Severity;
+    use crate::trace::{ExplainTrace, MatchInfo, PackSummary, TraceDetails, TraceStep};
 
     #[test]
     fn test_tree_node_creation() {
@@ -698,5 +1034,60 @@ mod tests {
         // render() goes to stderr, just verify no panic
         let tree = DcgTree::with_label("Test").child(TreeNode::new("child"));
         tree.render();
+    }
+
+    #[test]
+    fn test_explain_trace_tree_renders_decision_sections() {
+        let trace = ExplainTrace {
+            command: "git reset --hard HEAD".to_string(),
+            normalized_command: Some("git reset --hard HEAD".to_string()),
+            sanitized_command: None,
+            decision: EvaluationDecision::Deny,
+            skipped_due_to_budget: false,
+            total_duration_us: 1_250,
+            steps: vec![TraceStep {
+                name: "full_evaluation",
+                duration_us: 1_000,
+                details: TraceDetails::KeywordGating {
+                    quick_rejected: false,
+                    keywords_checked: vec!["git".to_string()],
+                    first_match: Some("core.git".to_string()),
+                },
+            }],
+            match_info: Some(MatchInfo {
+                rule_id: Some("core.git:reset-hard".to_string()),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                severity: Some(Severity::Critical),
+                reason: "git reset --hard destroys uncommitted changes".to_string(),
+                source: MatchSource::Pack,
+                match_start: Some(0),
+                match_end: Some(16),
+                matched_text_preview: Some("git reset --hard".to_string()),
+                explanation: Some("Rewrites the worktree and index.".to_string()),
+            }),
+            allowlist_info: None,
+            pack_summary: Some(PackSummary {
+                enabled_count: 2,
+                evaluated: vec!["core.git".to_string()],
+                skipped: vec!["core.filesystem".to_string()],
+            }),
+        };
+
+        let lines = explain_trace_tree(&trace)
+            .guides(DcgTreeGuides::Ascii)
+            .render_plain();
+        let output = lines.join("\n");
+
+        assert!(output.contains("DCG EXPLAIN"));
+        assert!(output.contains("Decision: DENY"));
+        assert!(output.contains("Latency: 1.25ms"));
+        assert!(output.contains("Command"));
+        assert!(output.contains("Rule ID: core.git:reset-hard"));
+        assert!(output.contains("Severity: Critical"));
+        assert!(output.contains("Pipeline Trace"));
+        assert!(output.contains("full_evaluation (1.00ms)"));
+        assert!(output.contains("matched: core.git"));
+        assert!(output.contains("Skipped (keyword gating): core.filesystem"));
     }
 }

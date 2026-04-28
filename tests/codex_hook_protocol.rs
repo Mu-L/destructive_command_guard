@@ -1480,6 +1480,174 @@ fn disable_core_filesystem_still_blocks_git_claude() {
 }
 
 // ===========================================================================
+// P2.11 — Allow-once round-trip under Codex
+//
+// Under Codex, allow-once code is in stderr (not stdout JSON). Extract it
+// from the colored deny block, redeem it, then retry — the command must pass.
+// ===========================================================================
+
+/// Extract the allow-once short_code from the pending_exceptions.jsonl
+/// in the hermetic HOME directory.
+fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<String> {
+    let pending_path = home.join(".config/dcg/pending_exceptions.jsonl");
+    let content = std::fs::read_to_string(&pending_path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(code) = val["short_code"].as_str() {
+                if code.len() >= 5 {
+                    return Some(code.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn codex_deny_creates_pending_exception_with_code() {
+    // Use a persistent HOME (not run_codex_hook, which cleans up its tempdir)
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_path = home.path().to_path_buf();
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let payload = build_codex_payload("git reset --hard HEAD~1");
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", &home_path)
+        .env("TMPDIR", home_path.join("tmp"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: payload.into_bytes(),
+        home_dir: home_path.clone(),
+    };
+
+    assert!(outcome.is_codex_block_shape(), "block expected\n{outcome}");
+
+    let code = extract_allow_once_code_from_pending_store(&home_path);
+    assert!(
+        code.is_some(),
+        "Codex deny must create a pending exception with short_code\n{outcome}"
+    );
+    assert!(
+        code.as_ref().unwrap().len() >= 5,
+        "short_code must be >= 5 chars, got {:?}\n{outcome}",
+        code
+    );
+}
+
+#[test]
+fn codex_allow_once_round_trip() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_path = home.path().to_path_buf();
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    // Step 1: Codex deny — creates pending exception in hermetic HOME
+    let deny_payload = build_codex_payload("git reset --hard HEAD~1");
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", &home_path)
+        .env("TMPDIR", home_path.join("tmp"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn deny");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(deny_payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let deny_outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: deny_payload.into_bytes(),
+        home_dir: home_path.clone(),
+    };
+
+    assert!(
+        deny_outcome.is_codex_block_shape(),
+        "initial Codex deny expected\n{deny_outcome}"
+    );
+
+    // Extract the allow-once code from the pending store
+    let allow_code = extract_allow_once_code_from_pending_store(&home_path)
+        .unwrap_or_else(|| panic!("pending store must contain short_code\n{deny_outcome}"));
+
+    // Step 2: Redeem the allow-once code
+    let redeem_output = Command::new(dcg_binary())
+        .arg("allow-once")
+        .arg(&allow_code)
+        .arg("--yes")
+        .env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", &home_path)
+        .env("TMPDIR", home_path.join("tmp"))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run allow-once redeem");
+
+    assert!(
+        redeem_output.status.success(),
+        "allow-once redeem must succeed (exit 0), got exit {}\nstdout: {}\nstderr: {}",
+        redeem_output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&redeem_output.stdout),
+        String::from_utf8_lossy(&redeem_output.stderr),
+    );
+
+    // Step 3: Retry under Codex — must now be allowed (exit 0)
+    let retry_payload = build_codex_payload("git reset --hard HEAD~1");
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", &home_path)
+        .env("TMPDIR", home_path.join("tmp"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn retry");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(retry_payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let retry_outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: retry_payload.into_bytes(),
+        home_dir: home_path.clone(),
+    };
+
+    assert!(
+        retry_outcome.is_allow_shape(),
+        "after allow-once redeem, Codex retry must be allowed (exit 0)\n{retry_outcome}"
+    );
+}
+
+// ===========================================================================
 // Hermetic HOME isolation + P2.14 Parallel test runner isolation
 //
 // Meta-tests that validate the test infrastructure itself. Without these,
@@ -1516,9 +1684,8 @@ fn smoke_hermetic_home_isolates_pending_exceptions() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::needless_collect)]
 fn parallel_spawn_storm_no_cross_contamination() {
-    use std::sync::Arc;
-
     let n = 16;
     let outcomes: Vec<HookOutcome> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..n)
@@ -1536,8 +1703,7 @@ fn parallel_spawn_storm_no_cross_contamination() {
     }
 
     // All N must have DISTINCT hermetic HOMEs
-    let homes: std::collections::HashSet<_> =
-        outcomes.iter().map(|o| o.home_dir.clone()).collect();
+    let homes: std::collections::HashSet<_> = outcomes.iter().map(|o| o.home_dir.clone()).collect();
     assert_eq!(
         homes.len(),
         n,
@@ -1551,7 +1717,7 @@ fn parallel_spawn_storm_no_cross_contamination() {
         if pending_dir.exists() {
             let entries: Vec<_> = std::fs::read_dir(&pending_dir)
                 .expect("read pending dir")
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
                 .collect();
             assert_eq!(
                 entries.len(),
@@ -1568,14 +1734,13 @@ fn parallel_spawn_storm_no_cross_contamination() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::needless_collect)]
 fn sequential_vs_parallel_produce_same_exit_codes() {
     let cmd = "git clean -fd";
     let n = 8;
 
     // Sequential
-    let seq_codes: Vec<i32> = (0..n)
-        .map(|_| run_codex_hook(cmd).exit_code)
-        .collect();
+    let seq_codes: Vec<i32> = (0..n).map(|_| run_codex_hook(cmd).exit_code).collect();
 
     // Parallel
     let par_codes: Vec<i32> = std::thread::scope(|s| {
@@ -1631,18 +1796,15 @@ fn hermetic_tests_do_not_touch_real_home() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::needless_collect)]
 fn parallel_mixed_protocol_storm() {
     let n = 8; // 8 Codex + 8 Claude = 16 total
     let cmd = "git reset --hard HEAD~1";
 
     let (codex_outcomes, claude_outcomes): (Vec<HookOutcome>, Vec<HookOutcome>) =
         std::thread::scope(|s| {
-            let codex_handles: Vec<_> = (0..n)
-                .map(|_| s.spawn(|| run_codex_hook(cmd)))
-                .collect();
-            let claude_handles: Vec<_> = (0..n)
-                .map(|_| s.spawn(|| run_claude_hook(cmd)))
-                .collect();
+            let codex_handles: Vec<_> = (0..n).map(|_| s.spawn(|| run_codex_hook(cmd))).collect();
+            let claude_handles: Vec<_> = (0..n).map(|_| s.spawn(|| run_claude_hook(cmd))).collect();
 
             let codex: Vec<_> = codex_handles
                 .into_iter()
