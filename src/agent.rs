@@ -408,7 +408,6 @@ fn detect_from_environment() -> Option<DetectionResult> {
 
 /// Detect agent from parent process.
 ///
-/// Reads `/proc/<ppid>/comm` on Linux to check the parent process name.
 /// This is a fallback for agents that don't set environment variables.
 #[cfg(target_os = "linux")]
 fn detect_from_parent_process() -> Option<DetectionResult> {
@@ -418,53 +417,140 @@ fn detect_from_parent_process() -> Option<DetectionResult> {
     let ppid = parent_id();
     let comm_path = format!("/proc/{ppid}/comm");
 
-    let process_name = fs::read_to_string(&comm_path).ok()?.trim().to_lowercase();
+    let process_name = fs::read_to_string(&comm_path).ok()?;
+    detection_from_process_name(&process_name)
+}
 
-    // Match known agent process names
-    if process_name.contains("claude") {
-        return Some(DetectionResult::new(
-            Agent::ClaudeCode,
-            DetectionMethod::Process,
-            Some(process_name),
-        ));
-    }
-    if process_name.contains("aider") {
-        return Some(DetectionResult::new(
-            Agent::Aider,
-            DetectionMethod::Process,
-            Some(process_name),
-        ));
-    }
-    if process_name.contains("codex") {
-        return Some(DetectionResult::new(
-            Agent::CodexCli,
-            DetectionMethod::Process,
-            Some(process_name),
-        ));
-    }
-    if process_name.contains("gemini") {
-        return Some(DetectionResult::new(
-            Agent::GeminiCli,
-            DetectionMethod::Process,
-            Some(process_name),
-        ));
-    }
-    if process_name.contains("copilot") {
-        return Some(DetectionResult::new(
-            Agent::CopilotCli,
-            DetectionMethod::Process,
-            Some(process_name),
-        ));
+/// Detect agent from parent process on Unix platforms without `/proc`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn detect_from_parent_process() -> Option<DetectionResult> {
+    use std::os::unix::process::parent_id;
+
+    let ppid = parent_id();
+    parent_process_name_from_ps(ppid).and_then(|name| detection_from_process_name(&name))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn parent_process_name_from_ps(pid: u32) -> Option<String> {
+    let pid = pid.to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid, "-o", "comm="])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
     }
 
+    first_non_empty_line(&String::from_utf8_lossy(&output.stdout))
+        .map(str::to_string)
+        .or_else(|| parent_process_args_from_ps(&pid))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn parent_process_args_from_ps(pid: &str) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", pid, "-o", "args="])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    first_non_empty_line(&String::from_utf8_lossy(&output.stdout)).map(str::to_string)
+}
+
+/// Detect agent from parent process on Windows.
+#[cfg(windows)]
+fn detect_from_parent_process() -> Option<DetectionResult> {
+    parent_process_name_from_windows(std::process::id())
+        .and_then(|name| detection_from_process_name(&name))
+}
+
+#[cfg(windows)]
+fn parent_process_name_from_windows(current_pid: u32) -> Option<String> {
+    let script = format!(
+        "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {current_pid}'; \
+         if ($null -eq $p) {{ exit 1 }}; \
+         $parent = Get-CimInstance Win32_Process -Filter \"ProcessId = $($p.ParentProcessId)\"; \
+         if ($null -eq $parent) {{ exit 1 }}; \
+         Write-Output $parent.Name"
+    );
+
+    ["powershell.exe", "powershell", "pwsh"]
+        .iter()
+        .find_map(|program| windows_parent_name_with(program, &script))
+}
+
+#[cfg(windows)]
+fn windows_parent_name_with(program: &str, script: &str) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    first_non_empty_line(&String::from_utf8_lossy(&output.stdout)).map(str::to_string)
+}
+
+/// Detect agent from parent process on platforms without a safe implementation.
+#[cfg(not(any(target_os = "linux", unix, windows)))]
+fn detect_from_parent_process() -> Option<DetectionResult> {
     None
 }
 
-/// Detect agent from parent process (non-Linux fallback - returns None).
-#[cfg(not(target_os = "linux"))]
-fn detect_from_parent_process() -> Option<DetectionResult> {
-    // Parent process detection is currently only implemented for Linux.
-    // On other platforms, we rely solely on environment variable detection.
+fn detection_from_process_name(raw_process_name: &str) -> Option<DetectionResult> {
+    let process_name = normalize_process_name(raw_process_name)?;
+    let agent = agent_from_process_name(&process_name)?;
+    Some(DetectionResult::new(
+        agent,
+        DetectionMethod::Process,
+        Some(process_name),
+    ))
+}
+
+fn normalize_process_name(raw_process_name: &str) -> Option<String> {
+    first_non_empty_line(raw_process_name).map(str::to_lowercase)
+}
+
+fn first_non_empty_line(value: &str) -> Option<&str> {
+    value.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn agent_from_process_name(process_name: &str) -> Option<Agent> {
+    let normalized = process_name.to_lowercase().replace('\\', "/");
+    let executable = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let executable = executable.strip_suffix(".exe").unwrap_or(executable);
+
+    if executable.contains("claude") || normalized.contains("/claude") {
+        return Some(Agent::ClaudeCode);
+    }
+    if executable.contains("augment") || executable.contains("auggie") {
+        return Some(Agent::AugmentCode);
+    }
+    if executable.contains("aider") {
+        return Some(Agent::Aider);
+    }
+    if executable.contains("continue") {
+        return Some(Agent::Continue);
+    }
+    if executable.contains("codex") || normalized.contains("/codex") {
+        return Some(Agent::CodexCli);
+    }
+    if executable.contains("gemini") {
+        return Some(Agent::GeminiCli);
+    }
+    if executable.contains("copilot") {
+        return Some(Agent::CopilotCli);
+    }
+    if executable.contains("cursor") {
+        return Some(Agent::CursorIde);
+    }
+
     None
 }
 
@@ -585,6 +671,57 @@ mod tests {
         assert_eq!(format!("{}", DetectionMethod::Explicit), "explicit flag");
         assert_eq!(format!("{}", DetectionMethod::Process), "parent process");
         assert_eq!(format!("{}", DetectionMethod::None), "not detected");
+    }
+
+    #[test]
+    fn test_agent_from_process_name_recognizes_known_agents() {
+        assert_eq!(agent_from_process_name("claude"), Some(Agent::ClaudeCode));
+        assert_eq!(
+            agent_from_process_name("/Applications/Claude.app/Contents/MacOS/Claude"),
+            Some(Agent::ClaudeCode)
+        );
+        assert_eq!(agent_from_process_name("auggie"), Some(Agent::AugmentCode));
+        assert_eq!(
+            agent_from_process_name("augment-code"),
+            Some(Agent::AugmentCode)
+        );
+        assert_eq!(agent_from_process_name("aider"), Some(Agent::Aider));
+        assert_eq!(agent_from_process_name("continue"), Some(Agent::Continue));
+        assert_eq!(agent_from_process_name("codex"), Some(Agent::CodexCli));
+        assert_eq!(
+            agent_from_process_name("node /usr/local/bin/codex"),
+            Some(Agent::CodexCli)
+        );
+        assert_eq!(agent_from_process_name("gemini"), Some(Agent::GeminiCli));
+        assert_eq!(
+            agent_from_process_name("copilot.exe"),
+            Some(Agent::CopilotCli)
+        );
+        assert_eq!(
+            agent_from_process_name(r"C:\Users\dev\AppData\Local\Programs\Cursor\Cursor.exe"),
+            Some(Agent::CursorIde)
+        );
+    }
+
+    #[test]
+    fn test_agent_from_process_name_ignores_unknown_processes() {
+        assert_eq!(agent_from_process_name("zsh"), None);
+        assert_eq!(agent_from_process_name("cargo test agent"), None);
+        assert_eq!(agent_from_process_name("node"), None);
+    }
+
+    #[test]
+    fn test_detection_from_process_name_normalizes_matches() {
+        let result = detection_from_process_name("\n  Codex.exe  \n").unwrap();
+
+        assert_eq!(result.agent, Agent::CodexCli);
+        assert_eq!(result.method, DetectionMethod::Process);
+        assert_eq!(result.matched_value, Some("codex.exe".to_string()));
+    }
+
+    #[test]
+    fn test_detection_from_process_name_rejects_empty_output() {
+        assert_eq!(detection_from_process_name("\n\n  "), None);
     }
 
     #[test]
