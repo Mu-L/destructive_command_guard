@@ -872,7 +872,7 @@ mod tests {
         assert!(highlighted.contains('\x1b'));
         assert!(highlighted.contains("git"));
         assert!(highlighted.contains("rm"));
-        assert!(highlighted.contains("\\"));
+        assert!(highlighted.contains('\\'));
 
         colored::control::unset_override();
     }

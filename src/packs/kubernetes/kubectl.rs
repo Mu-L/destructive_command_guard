@@ -583,11 +583,7 @@ mod tests {
             "force",
         );
         assert_blocks(&pack, "kubectl apply -f deploy.yaml --force", "force");
-        assert_blocks(
-            &pack,
-            "kubectl delete -f ./manifests/",
-            "directories",
-        );
+        assert_blocks(&pack, "kubectl delete -f ./manifests/", "directories");
     }
 
     #[test]
