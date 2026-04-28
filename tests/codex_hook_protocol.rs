@@ -519,6 +519,526 @@ fn claude_bypass_exits_zero_silently() {
     );
 }
 
+// ===========================================================================
+// P2.9 — Claude Code parity matrix
+//
+// Symmetric coverage to P2.2-P2.7 for the Claude Code protocol path.
+// Every Claude scenario has a paired Codex scenario above; this file lets
+// a reviewer read off which scenario tests which contract.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// P2.9.1 — Claude deny matrix: exit=0, stdout JSON with all documented fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_deny_matrix_multiple_destructive_commands() {
+    let commands = [
+        ("git reset --hard HEAD~5", "core.git"),
+        ("git clean -fd", "core.git"),
+        ("git push --force origin main", "core.git"),
+        ("rm -rf /important/data", "core.filesystem"),
+    ];
+
+    for (cmd, expected_pack_fragment) in commands {
+        let outcome = run_claude_hook(cmd);
+        assert_eq!(
+            outcome.exit_code, 0,
+            "Claude deny must exit 0 for '{cmd}'\n{outcome}"
+        );
+        assert!(
+            !outcome.stdout.is_empty(),
+            "Claude deny must produce non-empty stdout JSON for '{cmd}'\n{outcome}"
+        );
+        assert!(
+            outcome.is_claude_block_shape(),
+            "Claude deny must have hookSpecificOutput for '{cmd}'\n{outcome}"
+        );
+
+        let json = outcome.stdout_json();
+        let hso = &json["hookSpecificOutput"];
+
+        assert_eq!(
+            hso["hookEventName"], "PreToolUse",
+            "hookEventName must be PreToolUse for '{cmd}'\n{outcome}"
+        );
+        assert_eq!(
+            hso["permissionDecision"], "deny",
+            "permissionDecision must be deny for '{cmd}'\n{outcome}"
+        );
+        assert!(
+            hso["permissionDecisionReason"].is_string()
+                && !hso["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty(),
+            "permissionDecisionReason must be non-empty string for '{cmd}'\n{outcome}"
+        );
+
+        // allowOnceCode: 5+ character string
+        let code = hso["allowOnceCode"].as_str();
+        assert!(
+            code.is_some() && code.unwrap().len() >= 5,
+            "allowOnceCode must be >= 5 chars for '{cmd}', got: {code:?}\n{outcome}"
+        );
+
+        // allowOnceFullHash: sha256-length hex string
+        let hash = hso["allowOnceFullHash"].as_str();
+        assert!(
+            hash.is_some() && hash.unwrap().len() >= 16,
+            "allowOnceFullHash must be >= 16 chars for '{cmd}', got: {hash:?}\n{outcome}"
+        );
+
+        // packId contains the expected fragment
+        let pack_id = hso["packId"].as_str().unwrap_or("");
+        assert!(
+            pack_id.contains(expected_pack_fragment),
+            "packId must contain '{expected_pack_fragment}' for '{cmd}', got: '{pack_id}'\n{outcome}"
+        );
+
+        // ruleId is present and contains the pack
+        let rule_id = hso["ruleId"].as_str().unwrap_or("");
+        assert!(
+            rule_id.contains(expected_pack_fragment),
+            "ruleId must contain '{expected_pack_fragment}' for '{cmd}', got: '{rule_id}'\n{outcome}"
+        );
+
+        // severity is present and is a known value
+        let severity = hso["severity"].as_str().unwrap_or("");
+        assert!(
+            ["critical", "high", "medium", "low"].contains(&severity),
+            "severity must be a known level for '{cmd}', got: '{severity}'\n{outcome}"
+        );
+
+        // remediation block
+        assert!(
+            hso["remediation"].is_object(),
+            "remediation must be present as object for '{cmd}'\n{outcome}"
+        );
+        let remediation = &hso["remediation"];
+        let aoc = remediation["allowOnceCommand"].as_str().unwrap_or("");
+        assert!(
+            aoc.starts_with("dcg allow-once "),
+            "remediation.allowOnceCommand must start with 'dcg allow-once ' for '{cmd}', got: '{aoc}'\n{outcome}"
+        );
+
+        // stderr should also have a human-readable deny block
+        assert!(
+            !outcome.stderr.is_empty(),
+            "Claude deny stderr must be non-empty (colored deny block) for '{cmd}'\n{outcome}"
+        );
+    }
+}
+
+#[test]
+fn claude_deny_git_checkout_file_restore() {
+    let outcome = run_claude_hook("git checkout -- important_file.rs");
+    assert!(
+        outcome.is_claude_block_shape(),
+        "git checkout -- <file> must be denied by Claude\n{outcome}"
+    );
+    let json = outcome.stdout_json();
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+}
+
+#[test]
+fn claude_deny_or_warn_git_stash_drop() {
+    let outcome = run_claude_hook("git stash drop");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "git stash drop must exit 0 via Claude\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout.is_empty(),
+        "git stash drop must produce stdout JSON via Claude\n{outcome}"
+    );
+    let json = outcome.stdout_json();
+    let decision = json["hookSpecificOutput"]["permissionDecision"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        decision == "deny" || decision == "ask",
+        "git stash drop must be denied or warned (ask), got '{decision}'\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.9.2 — Claude allow matrix: exit=0, empty stdout, empty stderr
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_allow_safe_commands_produce_no_output() {
+    let safe_commands = [
+        "git status",
+        "git log --oneline -5",
+        "git diff HEAD",
+        "git checkout -b new-feature",
+        "ls -la",
+        "echo hello",
+        "cat README.md",
+    ];
+
+    for cmd in safe_commands {
+        let outcome = run_claude_hook(cmd);
+        assert_eq!(
+            outcome.exit_code, 0,
+            "safe command '{cmd}' must exit 0 via Claude\n{outcome}"
+        );
+        assert!(
+            outcome.stdout.is_empty(),
+            "safe command '{cmd}' must produce 0 bytes stdout via Claude\n{outcome}"
+        );
+    }
+}
+
+#[test]
+fn claude_allow_git_clean_dry_run_not_blocked() {
+    let outcome = run_claude_hook("git clean -n");
+    assert!(
+        outcome.is_allow_shape(),
+        "git clean -n (dry run) must be allowed via Claude\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.9.3 — Claude warn path: exit=0, stdout JSON with permissionDecision="ask"
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_warn_path_exits_zero_with_ask_json() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_dir = home.path().join(".config/dcg");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        b"[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+    )
+    .unwrap();
+
+    let payload = build_claude_payload("git reset --hard HEAD~1");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: payload.into_bytes(),
+        home_dir: home.path().to_path_buf(),
+    };
+
+    assert_eq!(
+        outcome.exit_code, 0,
+        "Claude warn must exit 0\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout.is_empty(),
+        "Claude warn must produce stdout JSON (unlike Codex warn which has empty stdout)\n{outcome}"
+    );
+
+    let json = outcome.stdout_json();
+    let hso = &json["hookSpecificOutput"];
+    assert_eq!(
+        hso["permissionDecision"], "ask",
+        "Claude warn must have permissionDecision='ask'\n{outcome}"
+    );
+    assert!(
+        hso["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("warn"),
+        "Claude warn reason must mention 'warn'\n{outcome}"
+    );
+
+    // stderr should have a human-visible warning
+    assert!(
+        !outcome.stderr.is_empty(),
+        "Claude warn stderr must be non-empty\n{outcome}"
+    );
+    assert!(
+        outcome.stderr_contains("WARNING") || outcome.stderr_contains("warn"),
+        "stderr must contain warning text\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.9.4 — Claude bypass: DCG_BYPASS=1 → silent exit 0, both buffers empty
+//
+// (Already covered by claude_bypass_exits_zero_silently above in P2.7;
+// replicated here so this P2.9 block is self-contained for Claude reasoning.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_bypass_destructive_command_fully_silent() {
+    let outcome = run_claude_hook_with_env("git reset --hard HEAD~1", &[("DCG_BYPASS", "1")], &[]);
+    assert_eq!(outcome.exit_code, 0, "Claude bypass must exit 0\n{outcome}");
+    assert!(
+        outcome.stdout.is_empty(),
+        "Claude bypass must produce no stdout\n{outcome}"
+    );
+    // stderr may have trace-level output but no deny/warn block
+    assert!(
+        !outcome.stderr_contains("BLOCKED") && !outcome.stderr_contains("deny"),
+        "Claude bypass must not contain BLOCKED or deny text on stderr\n{outcome}"
+    );
+}
+
+#[test]
+fn claude_bypass_empty_string_also_triggers() {
+    let outcome =
+        run_claude_hook_with_env("git reset --hard HEAD~1", &[("DCG_BYPASS", "")], &[]);
+    assert_eq!(
+        outcome.exit_code, 0,
+        "DCG_BYPASS='' (empty) must still trigger bypass\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "DCG_BYPASS='' must produce no stdout\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.9.5 — Claude history persistence: denials write history DB rows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_deny_writes_history_entry() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db_path = home.path().join("test-history.db");
+
+    // History is disabled by default — enable it via config + env override for DB path.
+    let config_dir = home.path().join(".config/dcg");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        b"[history]\nenabled = true\n",
+    )
+    .unwrap();
+
+    let payload = build_claude_payload("git reset --hard HEAD~1");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("NO_COLOR", "1")
+        .env("DCG_HISTORY_DB", &db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: payload.into_bytes(),
+        home_dir: home.path().to_path_buf(),
+    };
+
+    assert!(
+        outcome.is_claude_block_shape(),
+        "Claude deny expected\n{outcome}"
+    );
+
+    // Claude exits normally (not process::exit(2)), so Drop-based flush runs.
+    assert!(
+        db_path.exists(),
+        "history DB must exist after Claude deny at {}\n{outcome}",
+        db_path.display()
+    );
+
+    let db_size = std::fs::metadata(&db_path)
+        .expect("failed to stat history DB")
+        .len();
+    assert!(
+        db_size > 4096,
+        "history DB must be > 4096 bytes (contains data), got {db_size} bytes\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.9.6 — Claude allow-once round-trip: capture code → redeem → retry passes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_allow_once_round_trip() {
+    // Step 1: Get a Claude deny with allow-once code
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_path = home.path().to_path_buf();
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let deny_payload = build_claude_payload("git reset --hard HEAD~1");
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", &home_path)
+        .env("TMPDIR", home_path.join("tmp"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn deny");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(deny_payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let deny_outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: deny_payload.into_bytes(),
+        home_dir: home_path.clone(),
+    };
+
+    assert!(
+        deny_outcome.is_claude_block_shape(),
+        "initial deny expected\n{deny_outcome}"
+    );
+    let json = deny_outcome.stdout_json();
+    let allow_code = json["hookSpecificOutput"]["allowOnceCode"]
+        .as_str()
+        .unwrap_or_else(|| panic!("allowOnceCode must be present\n{deny_outcome}"));
+    assert!(
+        allow_code.len() >= 5,
+        "allowOnceCode too short: '{allow_code}'\n{deny_outcome}"
+    );
+
+    // Step 2: Redeem the allow-once code using `dcg allow-once <code> --yes`
+    let redeem_output = Command::new(dcg_binary())
+        .arg("allow-once")
+        .arg(allow_code)
+        .arg("--yes")
+        .env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", &home_path)
+        .env("TMPDIR", home_path.join("tmp"))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run allow-once redeem");
+
+    assert!(
+        redeem_output.status.success(),
+        "allow-once redeem must succeed (exit 0), got exit {}\nstdout: {}\nstderr: {}",
+        redeem_output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&redeem_output.stdout),
+        String::from_utf8_lossy(&redeem_output.stderr),
+    );
+
+    // Step 3: Retry the same command — should now be allowed
+    let retry_payload = build_claude_payload("git reset --hard HEAD~1");
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", &home_path)
+        .env("TMPDIR", home_path.join("tmp"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn retry");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(retry_payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let retry_outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: retry_payload.into_bytes(),
+        home_dir: home_path.clone(),
+    };
+
+    assert!(
+        retry_outcome.is_allow_shape(),
+        "after allow-once redeem, same command must be allowed\n{retry_outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.9.7 — Cross-protocol parity: same command produces structurally
+//          different but semantically equivalent output for both protocols
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cross_protocol_deny_structural_parity() {
+    let cmd = "git reset --hard HEAD~3";
+
+    let codex = run_codex_hook(cmd);
+    let claude = run_claude_hook(cmd);
+
+    // Both block the command
+    assert!(codex.is_codex_block_shape(), "Codex block shape expected\n{codex}");
+    assert!(claude.is_claude_block_shape(), "Claude block shape expected\n{claude}");
+
+    // Codex: exit 2, no stdout
+    assert_eq!(codex.exit_code, 2);
+    assert!(codex.stdout.is_empty());
+
+    // Claude: exit 0, JSON stdout
+    assert_eq!(claude.exit_code, 0);
+    let json = claude.stdout_json();
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+
+    // Both have non-empty stderr (the human-readable deny block)
+    assert!(!codex.stderr.is_empty(), "Codex must have stderr\n{codex}");
+    assert!(!claude.stderr.is_empty(), "Claude must have stderr\n{claude}");
+
+    // Both stderr mention the command
+    assert!(
+        codex.stderr_contains("git reset --hard"),
+        "Codex stderr must mention the command\n{codex}"
+    );
+    assert!(
+        claude.stderr_contains("git reset --hard"),
+        "Claude stderr must mention the command\n{claude}"
+    );
+}
+
+#[test]
+fn cross_protocol_allow_structural_parity() {
+    let cmd = "git status";
+
+    let codex = run_codex_hook(cmd);
+    let claude = run_claude_hook(cmd);
+
+    // Both allow the command
+    assert!(codex.is_allow_shape(), "Codex allow shape\n{codex}");
+    assert!(claude.is_allow_shape(), "Claude allow shape\n{claude}");
+
+    // Both exit 0 with empty stdout
+    assert_eq!(codex.exit_code, 0);
+    assert_eq!(claude.exit_code, 0);
+    assert!(codex.stdout.is_empty());
+    assert!(claude.stdout.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Hermetic HOME isolation
 // ---------------------------------------------------------------------------
