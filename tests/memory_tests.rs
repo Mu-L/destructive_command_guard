@@ -377,6 +377,322 @@ fn memory_full_pipeline() {
     });
 }
 
+//=============================================================================
+// Codex Protocol Memory Tests (ovw4.6.3)
+//
+// The Codex deny path calls process::exit(2) which skips Drop.
+// These tests exercise the Codex-specific code paths in-process to verify
+// no allocations leak across repeated invocations of the protocol detection,
+// evaluation, and output formatting pipeline.
+//=============================================================================
+
+/// Build a Codex-format hook input JSON string (includes turn_id).
+fn sample_codex_input(cmd: &str) -> String {
+    format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":"{}"}},"turn_id":"test-turn-0001"}}"#,
+        cmd.replace('\\', r"\\").replace('"', r#"\""#)
+    )
+}
+
+/// Build a Claude-format hook input JSON string (no turn_id).
+fn sample_claude_input(cmd: &str) -> String {
+    sample_hook_input(cmd)
+}
+
+#[test]
+fn memory_codex_protocol_detection() {
+    let codex_inputs: Vec<String> = [
+        "git reset --hard HEAD~3",
+        "rm -rf /",
+        "chmod 777 /etc/passwd",
+        "dd if=/dev/zero of=/dev/sda",
+        "ls -la",
+        "cargo build",
+    ]
+    .iter()
+    .map(|cmd| sample_codex_input(cmd))
+    .collect();
+
+    let claude_inputs: Vec<String> = [
+        "git reset --hard HEAD~3",
+        "rm -rf /",
+        "ls -la",
+    ]
+    .iter()
+    .map(|cmd| sample_claude_input(cmd))
+    .collect();
+
+    assert_no_leak("codex_protocol_detection", 1000, 2 * 1024 * 1024, || {
+        for json in &codex_inputs {
+            if let Ok(input) = serde_json::from_str::<dcg::HookInput>(json) {
+                let proto = dcg::hook::detect_protocol(&input);
+                black_box(proto);
+            }
+        }
+        for json in &claude_inputs {
+            if let Ok(input) = serde_json::from_str::<dcg::HookInput>(json) {
+                let proto = dcg::hook::detect_protocol(&input);
+                black_box(proto);
+            }
+        }
+    });
+}
+
+#[test]
+fn memory_codex_deny_pipeline() {
+    let mut config = dcg::Config::load();
+    config.packs.enabled.clear();
+    let compiled_overrides = config.overrides.compile();
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = dcg::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let allowlists = dcg::load_default_allowlists();
+
+    let destructive_cmds = [
+        "git reset --hard HEAD~3",
+        "rm -rf build/",
+        "sudo rm -rf /",
+    ];
+
+    let codex_inputs: Vec<String> = destructive_cmds
+        .iter()
+        .map(|cmd| sample_codex_input(cmd))
+        .collect();
+
+    let run_codex_pipeline = || {
+        for json in &codex_inputs {
+            if let Ok(input) = serde_json::from_str::<dcg::HookInput>(json) {
+                let protocol = dcg::hook::detect_protocol(&input);
+                if let Some((cmd, _)) = dcg::hook::extract_command_with_protocol(&input) {
+                    let result = dcg::evaluate_command(
+                        &cmd,
+                        &config,
+                        &enabled_keywords,
+                        &compiled_overrides,
+                        &allowlists,
+                    );
+                    if result.is_denied() {
+                        let pi = result.pattern_info.as_ref();
+                        let mut stdout_buf = Vec::with_capacity(4096);
+                        let mut stderr_buf = Vec::with_capacity(4096);
+                        dcg::hook::write_denial_to(
+                            &mut stdout_buf,
+                            &mut stderr_buf,
+                            protocol,
+                            &cmd,
+                            result.reason().unwrap_or("blocked"),
+                            result.pack_id(),
+                            pi.and_then(|p| p.pattern_name.as_deref()),
+                            pi.and_then(|p| p.explanation.as_deref()),
+                            None,
+                            pi.and_then(|p| p.matched_span.as_ref()),
+                            pi.and_then(|p| p.severity),
+                            None,
+                            pi.map_or(&[], |p| p.suggestions),
+                        );
+                        black_box(&stdout_buf);
+                        black_box(&stderr_buf);
+                    }
+                }
+            }
+        }
+    };
+
+    run_codex_pipeline();
+
+    assert_no_leak("codex_deny_pipeline", 500, 2 * 1024 * 1024, || {
+        run_codex_pipeline();
+    });
+}
+
+#[test]
+fn memory_codex_deny_output_formatting() {
+    let allow_once = dcg::hook::AllowOnceInfo {
+        code: "abc12".to_string(),
+        full_hash: "deadbeef1234567890".to_string(),
+    };
+
+    assert_no_leak(
+        "codex_deny_output_formatting",
+        1000,
+        2 * 1024 * 1024,
+        || {
+            let mut stdout_buf = Vec::with_capacity(4096);
+            let mut stderr_buf = Vec::with_capacity(4096);
+
+            dcg::hook::write_denial_to(
+                &mut stdout_buf,
+                &mut stderr_buf,
+                dcg::hook::HookProtocol::Codex,
+                "git reset --hard HEAD~3",
+                "Destructive git operation",
+                Some("core.git"),
+                Some("git_reset_hard"),
+                Some("Use git stash or create a backup branch first"),
+                Some(&allow_once),
+                None,
+                Some(dcg::packs::Severity::Critical),
+                Some(0.95),
+                &[],
+            );
+            black_box(&stdout_buf);
+            black_box(&stderr_buf);
+
+            // Codex path: stdout should be empty (no JSON), stderr has colored message
+            debug_assert!(stdout_buf.is_empty(), "Codex deny should not write to stdout");
+
+            stdout_buf.clear();
+            stderr_buf.clear();
+        },
+    );
+}
+
+#[test]
+fn memory_codex_vs_claude_deny_parity() {
+    let mut config = dcg::Config::load();
+    config.packs.enabled.clear();
+    let compiled_overrides = config.overrides.compile();
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = dcg::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let allowlists = dcg::load_default_allowlists();
+
+    let cmd = "git reset --hard HEAD~3";
+    let codex_json = sample_codex_input(cmd);
+    let claude_json = sample_claude_input(cmd);
+
+    let run_both = || {
+        for (json, expected_proto_is_codex) in [(&codex_json, true), (&claude_json, false)] {
+            if let Ok(input) = serde_json::from_str::<dcg::HookInput>(json) {
+                let protocol = dcg::hook::detect_protocol(&input);
+                if expected_proto_is_codex {
+                    debug_assert!(
+                        matches!(protocol, dcg::hook::HookProtocol::Codex),
+                        "turn_id input should detect as Codex"
+                    );
+                }
+                if let Some((extracted, _)) = dcg::hook::extract_command_with_protocol(&input) {
+                    let result = dcg::evaluate_command(
+                        &extracted,
+                        &config,
+                        &enabled_keywords,
+                        &compiled_overrides,
+                        &allowlists,
+                    );
+                    if result.is_denied() {
+                        let pi = result.pattern_info.as_ref();
+                        let mut stdout_buf = Vec::with_capacity(4096);
+                        let mut stderr_buf = Vec::with_capacity(4096);
+                        dcg::hook::write_denial_to(
+                            &mut stdout_buf,
+                            &mut stderr_buf,
+                            protocol,
+                            &extracted,
+                            result.reason().unwrap_or("blocked"),
+                            result.pack_id(),
+                            pi.and_then(|p| p.pattern_name.as_deref()),
+                            pi.and_then(|p| p.explanation.as_deref()),
+                            None,
+                            pi.and_then(|p| p.matched_span.as_ref()),
+                            pi.and_then(|p| p.severity),
+                            None,
+                            pi.map_or(&[], |p| p.suggestions),
+                        );
+                        black_box(&stdout_buf);
+                        black_box(&stderr_buf);
+                    }
+                }
+            }
+        }
+    };
+
+    run_both();
+
+    assert_no_leak("codex_vs_claude_deny_parity", 500, 2 * 1024 * 1024, || {
+        run_both();
+    });
+}
+
+#[test]
+fn memory_codex_subprocess_deny_loop() {
+    if is_coverage_build() {
+        println!("memory_codex_subprocess_deny_loop: SKIPPED (coverage build)");
+        return;
+    }
+
+    let Some(baseline) = get_memory_usage() else {
+        println!("memory_codex_subprocess_deny_loop: SKIPPED (no memory tracking)");
+        return;
+    };
+
+    let dcg_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"));
+    if !dcg_bin.exists() {
+        println!("memory_codex_subprocess_deny_loop: SKIPPED (dcg binary not found)");
+        return;
+    }
+
+    let codex_payload = sample_codex_input("git reset --hard HEAD~3");
+    let iterations = 50;
+
+    println!(
+        "memory_codex_subprocess_deny_loop: spawning {} dcg subprocesses (baseline: {} KB)",
+        iterations,
+        baseline / 1024
+    );
+
+    for i in 0..iterations {
+        let mut child = std::process::Command::new(&dcg_bin)
+            .env_clear()
+            .env("HOME", "/tmp/dcg_memtest_home")
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn dcg");
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(codex_payload.as_bytes());
+        }
+
+        let output = child.wait_with_output().expect("wait dcg");
+        debug_assert_eq!(output.status.code(), Some(2), "Codex deny should exit 2");
+
+        if i > 0 && i % 10 == 0 {
+            if let Some(current) = get_memory_usage() {
+                let growth = current.saturating_sub(baseline);
+                println!(
+                    "memory_codex_subprocess_deny_loop: {}/{}, parent growth: {} KB",
+                    i,
+                    iterations,
+                    growth / 1024
+                );
+            }
+        }
+    }
+
+    let final_mem = get_memory_usage().unwrap_or(baseline);
+    let growth = final_mem.saturating_sub(baseline);
+    let max_growth = 2 * 1024 * 1024;
+
+    println!(
+        "memory_codex_subprocess_deny_loop: final parent growth: {} KB (limit: {} KB)",
+        growth / 1024,
+        max_growth / 1024
+    );
+
+    assert!(
+        growth <= max_growth,
+        "Parent process grew by {} KB after {} subprocess spawns (limit: {} KB) — \
+         possible fd or buffer leak in subprocess management",
+        growth / 1024,
+        iterations,
+        max_growth / 1024
+    );
+
+    println!("memory_codex_subprocess_deny_loop: PASSED");
+}
+
 #[test]
 fn memory_leak_self_test() {
     if get_memory_usage().is_none() {
