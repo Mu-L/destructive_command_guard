@@ -812,8 +812,16 @@ fn select_allowlist_scope(timeout: Duration) -> Result<AllowlistScope, InputErro
                     Ok(AllowlistScope::Temporary(Duration::from_secs(24 * 3600)))
                 }
                 "p" | "permanent" | "perm" | "4" => Ok(AllowlistScope::Permanent),
-                "" => Ok(AllowlistScope::Once), // Default to once
-                _ => Ok(AllowlistScope::Once),  // Invalid input defaults to once (safest)
+                // Empty / unrecognized input must NOT silently allow.
+                // The denial UI tells the user `[Enter]` = "Keep blocked",
+                // and for `VerificationMethod::None` this prompt is the
+                // ONLY gate before allowing — defaulting to `Once` here
+                // turns Enter into a hands-free allow. Treat both cases
+                // as an explicit cancel so the caller (run_interactive_prompt)
+                // returns `InteractiveResult::Cancelled` and the command
+                // stays blocked.
+                "" => Err(InputError::Interrupted),
+                _ => Err(InputError::Interrupted),
             }
         }
         Err(err) => Err(err),
