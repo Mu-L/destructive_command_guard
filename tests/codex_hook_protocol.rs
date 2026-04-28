@@ -10,7 +10,7 @@
 #![allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 
 use std::fmt;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -198,9 +198,13 @@ pub fn run_hook_raw(json_bytes: &[u8], extra_env: &[(&str, &str)]) -> HookOutcom
 
     {
         let stdin = child.stdin.as_mut().expect("failed to get stdin");
-        stdin
-            .write_all(json_bytes)
-            .expect("failed to write to stdin");
+        if let Err(err) = stdin.write_all(json_bytes) {
+            assert_eq!(
+                err.kind(),
+                ErrorKind::BrokenPipe,
+                "failed to write to stdin: {err}"
+            );
+        }
     }
 
     let output = child.wait_with_output().expect("failed to wait for dcg");

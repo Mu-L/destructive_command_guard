@@ -1,0 +1,702 @@
+#!/bin/bash
+#
+# Real Codex CLI end-to-end harness for dcg.
+#
+# This scaffold mirrors scripts/e2e_test.sh logging conventions, but drives the
+# real `codex exec` binary against hermetic temporary repositories. It is
+# intentionally skip-friendly: machines without Codex installed or authenticated
+# exit 0 with an explicit skipped status.
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+BOLD='\033[1m'
+
+VERBOSE=false
+JSON_OUTPUT=false
+ARTIFACTS_DIR=""
+CODEX_BINARY="codex"
+DCG_BINARY="${HOME}/.local/bin/dcg"
+KEEP_TEMPDIRS=false
+FILTER=""
+TIMEOUT_SEC=120
+RUN_SELF_TEST=true
+
+TESTS_TOTAL=0
+TESTS_PASSED=0
+TESTS_FAILED=0
+TESTS_SKIPPED=0
+CURRENT_TEST=""
+CURRENT_TEST_START=0
+
+declare -a TEMP_DIRS=()
+
+usage() {
+    cat <<'USAGE'
+Usage: ./scripts/e2e_codex.sh [OPTIONS]
+
+Options:
+  --verbose, -v        Show detailed output for each test
+  --json, -j           Emit JSONL test results plus a summary
+  --artifacts DIR      Write trace.jsonl and per-test failure artifacts
+  --codex-binary PATH  Codex binary to run (default: codex from PATH)
+  --dcg-binary PATH    dcg binary to validate/use (default: ~/.local/bin/dcg)
+  --keep-tempdirs      Preserve temporary repos and homes for debugging
+  --filter REGEX       Only run tests whose name matches REGEX
+  --timeout-sec N      Per-test timeout in seconds (default: 120)
+  --no-self-test       Skip pre-flight harness self-test
+  --help, -h           Show this help
+
+Exit codes:
+  0  All tests passed or suite skipped because Codex is unavailable
+  1  One or more tests failed
+  2  Setup error unrelated to Codex availability
+USAGE
+}
+
+timestamp_utc() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+timestamp_ms() {
+    if date +%s%N >/dev/null 2>&1; then
+        echo $(( $(date +%s%N) / 1000000 ))
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    echo -n "$s"
+}
+
+json_array() {
+    local first=true
+    echo -n "["
+    for item in "$@"; do
+        if ! $first; then
+            echo -n ","
+        fi
+        first=false
+        echo -n "\"$(json_escape "$item")\""
+    done
+    echo -n "]"
+}
+
+ensure_artifacts_dir() {
+    if [[ -n "$ARTIFACTS_DIR" ]]; then
+        mkdir -p "$ARTIFACTS_DIR"
+        ARTIFACTS_DIR="$(cd "$ARTIFACTS_DIR" && pwd)"
+        : > "${ARTIFACTS_DIR}/trace.jsonl"
+    fi
+}
+
+trace_event() {
+    local event="$1"
+    local test="${2:-}"
+    local fields="${3:-}"
+    if [[ -z "$ARTIFACTS_DIR" ]]; then
+        return
+    fi
+    local escaped_event escaped_test
+    escaped_event=$(json_escape "$event")
+    escaped_test=$(json_escape "$test")
+    if [[ -n "$fields" ]]; then
+        printf '{"ts":"%s","event":"%s","test":"%s",%s}\n' \
+            "$(timestamp_utc)" "$escaped_event" "$escaped_test" "$fields" \
+            >> "${ARTIFACTS_DIR}/trace.jsonl"
+    else
+        printf '{"ts":"%s","event":"%s","test":"%s"}\n' \
+            "$(timestamp_utc)" "$escaped_event" "$escaped_test" \
+            >> "${ARTIFACTS_DIR}/trace.jsonl"
+    fi
+}
+
+log_info() {
+    local msg="$1"
+    if $VERBOSE && ! $JSON_OUTPUT; then
+        echo -e "  ${CYAN}${msg}${NC}"
+    fi
+}
+
+log_start() {
+    CURRENT_TEST="$1"
+    CURRENT_TEST_START=$(timestamp_ms)
+    ((++TESTS_TOTAL))
+    trace_event "test_start" "$CURRENT_TEST"
+    if $VERBOSE && ! $JSON_OUTPUT; then
+        echo -e "${CYAN}[T${TESTS_TOTAL}]${NC} ${CURRENT_TEST}"
+    fi
+}
+
+emit_result() {
+    local status="$1"
+    local test="$2"
+    local detail="${3:-}"
+    local end_ms duration_ms
+    end_ms=$(timestamp_ms)
+    duration_ms=$((end_ms - CURRENT_TEST_START))
+
+    trace_event "test_end" "$test" \
+        "\"status\":\"$(json_escape "$status")\",\"duration_ms\":${duration_ms}"
+
+    case "$status" in
+        PASS) ((++TESTS_PASSED)) ;;
+        FAIL) ((++TESTS_FAILED)) ;;
+        SKIP) ((++TESTS_SKIPPED)) ;;
+    esac
+
+    if $JSON_OUTPUT; then
+        printf '{"type":"test","name":"%s","status":"%s","duration_ms":%s,"detail":"%s"}\n' \
+            "$(json_escape "$test")" "$status" "$duration_ms" "$(json_escape "$detail")"
+        return
+    fi
+
+    case "$status" in
+        PASS)
+            echo -e "${GREEN}PASS${NC} ${test} ${CYAN}(${duration_ms}ms)${NC}"
+            ;;
+        FAIL)
+            echo -e "${RED}FAIL${NC} ${test} ${CYAN}(${duration_ms}ms)${NC}"
+            if [[ -n "$detail" ]]; then
+                echo -e "  ${YELLOW}${detail}${NC}"
+            fi
+            ;;
+        SKIP)
+            echo -e "${YELLOW}SKIP${NC} ${test}: ${detail}"
+            ;;
+    esac
+}
+
+skip_suite() {
+    local reason="$1"
+    CURRENT_TEST_START=$(timestamp_ms)
+    trace_event "suite_skip" "suite" "\"reason\":\"$(json_escape "$reason")\""
+    ((++TESTS_SKIPPED))
+    if $JSON_OUTPUT; then
+        printf '{"type":"summary","status":"skipped","reason":"%s","passed":0,"failed":0,"skipped":1}\n' \
+            "$(json_escape "$reason")"
+    else
+        echo -e "${YELLOW}SKIPPED:${NC} ${reason}"
+    fi
+    exit 0
+}
+
+safe_register_tempdir() {
+    local dir="$1"
+    TEMP_DIRS+=("$dir")
+}
+
+safe_remove_tree() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
+
+    local base parent tmp_base
+    base="$(basename "$dir")"
+    parent="$(cd "$(dirname "$dir")" && pwd)"
+    tmp_base="$(cd "${TMPDIR:-/tmp}" && pwd)"
+
+    if [[ "$parent" != "$tmp_base" && "$parent" != "/tmp" && "$parent" != "/data/tmp" ]]; then
+        echo "Refusing to clean non-temp path: $dir" >&2
+        return 1
+    fi
+    if [[ "$base" != codex_e2e_* ]]; then
+        echo "Refusing to clean unexpected temp dir name: $dir" >&2
+        return 1
+    fi
+
+    rm -r -- "$dir"
+}
+
+cleanup() {
+    if $KEEP_TEMPDIRS; then
+        if [[ ${#TEMP_DIRS[@]} -gt 0 ]] && $VERBOSE && ! $JSON_OUTPUT; then
+            echo -e "${YELLOW}Keeping tempdirs:${NC} ${TEMP_DIRS[*]}"
+        fi
+        return 0
+    fi
+    for dir in "${TEMP_DIRS[@]}"; do
+        safe_remove_tree "$dir" || true
+    done
+}
+trap cleanup EXIT
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --verbose|-v)
+                VERBOSE=true
+                shift
+                ;;
+            --json|-j)
+                JSON_OUTPUT=true
+                shift
+                ;;
+            --artifacts)
+                ARTIFACTS_DIR="$2"
+                shift 2
+                ;;
+            --codex-binary)
+                CODEX_BINARY="$2"
+                shift 2
+                ;;
+            --dcg-binary)
+                DCG_BINARY="$2"
+                shift 2
+                ;;
+            --keep-tempdirs)
+                KEEP_TEMPDIRS=true
+                shift
+                ;;
+            --filter)
+                FILTER="$2"
+                shift 2
+                ;;
+            --timeout-sec)
+                TIMEOUT_SEC="$2"
+                shift 2
+                ;;
+            --no-self-test)
+                RUN_SELF_TEST=false
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    if ! [[ "$TIMEOUT_SEC" =~ ^[0-9]+$ ]] || [[ "$TIMEOUT_SEC" -lt 1 ]]; then
+        echo "--timeout-sec must be a positive integer" >&2
+        exit 2
+    fi
+}
+
+resolve_binary() {
+    local candidate="$1"
+    if [[ "$candidate" == */* ]]; then
+        [[ -x "$candidate" ]] && echo "$candidate"
+        return
+    fi
+    command -v "$candidate" 2>/dev/null || true
+}
+
+version_at_least() {
+    local found="$1"
+    local required="$2"
+    [[ "$(printf '%s\n%s\n' "$required" "$found" | sort -V | head -n1)" == "$required" ]]
+}
+
+require_codex() {
+    local resolved version_output version
+    resolved="$(resolve_binary "$CODEX_BINARY")"
+    if [[ -z "$resolved" ]]; then
+        skip_suite "codex CLI not on PATH"
+    fi
+    CODEX_BINARY="$resolved"
+
+    if ! version_output="$("$CODEX_BINARY" --version 2>&1)"; then
+        skip_suite "codex --version failed: ${version_output}"
+    fi
+    version="$(echo "$version_output" | grep -Eo '[0-9]+[.][0-9]+[.][0-9]+' | head -1 || true)"
+    if [[ -z "$version" ]]; then
+        skip_suite "could not parse codex version from: ${version_output}"
+    fi
+    if ! version_at_least "$version" "0.125.0"; then
+        skip_suite "codex 0.125.0+ required, found ${version}"
+    fi
+
+    if "$CODEX_BINARY" login status >/dev/null 2>&1; then
+        return 0
+    fi
+    if "$CODEX_BINARY" auth status >/dev/null 2>&1; then
+        return 0
+    fi
+    skip_suite "codex not authenticated"
+}
+
+codex_hook_json() {
+    local command="$1"
+    printf '{"session_id":"dcg-e2e-session","turn_id":"turn-dcg-e2e","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"%s"},"tool_use_id":"call-dcg-e2e"}' \
+        "$(json_escape "$command")"
+}
+
+require_dcg() {
+    if [[ ! -x "$DCG_BINARY" ]]; then
+        echo "dcg binary missing or not executable: $DCG_BINARY" >&2
+        exit 2
+    fi
+
+    local out_file err_file exit_code
+    out_file="$(mktemp)"
+    err_file="$(mktemp)"
+
+    set +e
+    codex_hook_json "git status" | "$DCG_BINARY" >"$out_file" 2>"$err_file"
+    exit_code=$?
+    set -e
+    if [[ "$exit_code" -ne 0 || -s "$out_file" || -s "$err_file" ]]; then
+        echo "dcg safe-command Codex protocol gate failed (exit=${exit_code})" >&2
+        exit 2
+    fi
+
+    : > "$out_file"
+    : > "$err_file"
+    set +e
+    codex_hook_json "git reset --hard" | "$DCG_BINARY" >"$out_file" 2>"$err_file"
+    exit_code=$?
+    set -e
+    if [[ "$exit_code" -ne 2 || -s "$out_file" || ! -s "$err_file" ]]; then
+        echo "dcg deny-command Codex protocol gate failed (exit=${exit_code})" >&2
+        echo "stdout: $(cat "$out_file")" >&2
+        echo "stderr: $(cat "$err_file")" >&2
+        exit 2
+    fi
+}
+
+new_temp_dir() {
+    local dir
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/codex_e2e_XXXXXX")"
+    safe_register_tempdir "$dir"
+    echo "$dir"
+}
+
+write_manifest() {
+    local repo="$1"
+    local dest="$2"
+    (
+        cd "$repo"
+        find . -path ./.git -prune -o -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum
+    ) > "$dest"
+}
+
+write_state() {
+    local repo="$1"
+    local dest="$2"
+    {
+        echo "## git status --porcelain"
+        git -C "$repo" status --porcelain
+        echo
+        echo "## tracked file contents"
+        find "$repo" -path "$repo/.git" -prune -o -type f -print \
+            | sort \
+            | while read -r file; do
+                echo "--- ${file#"$repo"/}"
+                sed -n '1,120p' "$file"
+            done
+    } > "$dest"
+}
+
+mk_test_repo() {
+    local root repo
+    root="$(new_temp_dir)"
+    repo="${root}/repo"
+    mkdir -p "$repo"
+    git -C "$repo" init --quiet
+    git -C "$repo" config user.email "dcg-e2e@example.invalid"
+    git -C "$repo" config user.name "dcg e2e"
+    printf 'hello\n' > "${repo}/file.txt"
+    git -C "$repo" add file.txt
+    git -C "$repo" commit --quiet -m "seed"
+    printf 'modified\n' > "${repo}/file.txt"
+    echo "$repo"
+}
+
+test_matches_filter() {
+    local name="$1"
+    [[ -z "$FILTER" || "$name" =~ $FILTER ]]
+}
+
+save_failure_artifacts() {
+    local test_name="$1"
+    local repo="$2"
+    local prompt_file="$3"
+    local stdout_file="$4"
+    local stderr_file="$5"
+    local pre_state="$6"
+    local post_state="$7"
+    local pre_manifest="$8"
+    local post_manifest="$9"
+    local timings_file="${10}"
+
+    [[ -n "$ARTIFACTS_DIR" ]] || return 0
+
+    local dir
+    dir="${ARTIFACTS_DIR}/${test_name}"
+    mkdir -p "$dir"
+    cp "$stdout_file" "${dir}/codex_stdout.txt"
+    cp "$stderr_file" "${dir}/codex_stderr.txt"
+    cp "$prompt_file" "${dir}/prompt.txt"
+    cp "$pre_state" "${dir}/pre_state.txt"
+    cp "$post_state" "${dir}/post_state.txt"
+    cp "$pre_manifest" "${dir}/manifest_pre.txt"
+    cp "$post_manifest" "${dir}/manifest_post.txt"
+    cp "$timings_file" "${dir}/timings.json"
+    git -C "$repo" diff > "${dir}/diff.txt" || true
+}
+
+assert_repo_unchanged() {
+    local pre_state="$1"
+    local post_state="$2"
+    local pre_manifest="$3"
+    local post_manifest="$4"
+
+    cmp -s "$pre_state" "$post_state" && cmp -s "$pre_manifest" "$post_manifest"
+}
+
+run_codex_exec() {
+    local test_name="$1"
+    local prompt_file="$2"
+    local repo="$3"
+    local test_home="$4"
+    local stdout_file="$5"
+    local stderr_file="$6"
+
+    local argv_json
+    argv_json=$(json_array \
+        "$CODEX_BINARY" "exec" "--dangerously-bypass-approvals-and-sandbox" \
+        "-s" "danger-full-access" "--cd" "$repo")
+    trace_event "codex_invoke" "$test_name" \
+        "\"argv\":${argv_json},\"cwd\":\"$(json_escape "$repo")\",\"home\":\"$(json_escape "$test_home")\""
+
+    local start_ms end_ms exit_code
+    start_ms=$(timestamp_ms)
+    set +e
+    HOME="$test_home" \
+        timeout "${TIMEOUT_SEC}s" \
+        "$CODEX_BINARY" exec --dangerously-bypass-approvals-and-sandbox \
+            -s danger-full-access --cd "$repo" \
+            < "$prompt_file" > "$stdout_file" 2> "$stderr_file"
+    exit_code=$?
+    set -e
+    end_ms=$(timestamp_ms)
+
+    trace_event "codex_complete" "$test_name" \
+        "\"exit_code\":${exit_code},\"duration_ms\":$((end_ms - start_ms)),\"stdout_bytes\":$(wc -c < "$stdout_file"),\"stderr_bytes\":$(wc -c < "$stderr_file")"
+    echo "$exit_code"
+}
+
+run_codex_allow_test() {
+    local test_name="$1"
+    local prompt_file="$2"
+    local repo="$3"
+
+    test_matches_filter "$test_name" || return 0
+    log_start "$test_name"
+
+    local root test_home stdout_file stderr_file pre_state post_state pre_manifest post_manifest timings_file exit_code
+    root="$(new_temp_dir)"
+    test_home="${root}/home"
+    mkdir -p "$test_home"
+    stdout_file="${root}/codex_stdout.txt"
+    stderr_file="${root}/codex_stderr.txt"
+    pre_state="${root}/pre_state.txt"
+    post_state="${root}/post_state.txt"
+    pre_manifest="${root}/manifest_pre.txt"
+    post_manifest="${root}/manifest_post.txt"
+    timings_file="${root}/timings.json"
+
+    write_state "$repo" "$pre_state"
+    write_manifest "$repo" "$pre_manifest"
+
+    exit_code="$(run_codex_exec "$test_name" "$prompt_file" "$repo" "$test_home" "$stdout_file" "$stderr_file")"
+
+    write_state "$repo" "$post_state"
+    write_manifest "$repo" "$post_manifest"
+    printf '{"exit_code":%s,"timeout_sec":%s}\n' "$exit_code" "$TIMEOUT_SEC" > "$timings_file"
+
+    if grep -q "hook: PreToolUse Blocked" "$stdout_file" "$stderr_file"; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "safe Codex run was blocked"
+        return 0
+    fi
+    if ! assert_repo_unchanged "$pre_state" "$post_state" "$pre_manifest" "$post_manifest"; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "safe Codex run changed repository state"
+        return 0
+    fi
+
+    trace_event "assert" "$test_name" "\"name\":\"safe_command_allowed\",\"passed\":true"
+    emit_result "PASS" "$test_name"
+}
+
+run_codex_block_test() {
+    local test_name="$1"
+    local prompt_file="$2"
+    local repo="$3"
+    local expected_rule="$4"
+    local expected_command="$5"
+
+    test_matches_filter "$test_name" || return 0
+    log_start "$test_name"
+
+    local root test_home stdout_file stderr_file pre_state post_state pre_manifest post_manifest timings_file exit_code
+    root="$(new_temp_dir)"
+    test_home="${root}/home"
+    mkdir -p "$test_home"
+    stdout_file="${root}/codex_stdout.txt"
+    stderr_file="${root}/codex_stderr.txt"
+    pre_state="${root}/pre_state.txt"
+    post_state="${root}/post_state.txt"
+    pre_manifest="${root}/manifest_pre.txt"
+    post_manifest="${root}/manifest_post.txt"
+    timings_file="${root}/timings.json"
+
+    write_state "$repo" "$pre_state"
+    write_manifest "$repo" "$pre_manifest"
+
+    exit_code="$(run_codex_exec "$test_name" "$prompt_file" "$repo" "$test_home" "$stdout_file" "$stderr_file")"
+
+    write_state "$repo" "$post_state"
+    write_manifest "$repo" "$post_manifest"
+    printf '{"exit_code":%s,"timeout_sec":%s}\n' "$exit_code" "$TIMEOUT_SEC" > "$timings_file"
+
+    local combined
+    combined="$(cat "$stdout_file" "$stderr_file")"
+    if ! grep -q "hook: PreToolUse Blocked" <<< "$combined"; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "Codex did not report PreToolUse Blocked"
+        return 0
+    fi
+    if [[ -n "$expected_rule" && "$combined" != *"$expected_rule"* ]]; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "missing expected rule substring: $expected_rule"
+        return 0
+    fi
+    if [[ -n "$expected_command" && "$combined" != *"$expected_command"* ]]; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "missing expected command substring: $expected_command"
+        return 0
+    fi
+    if ! assert_repo_unchanged "$pre_state" "$post_state" "$pre_manifest" "$post_manifest"; then
+        save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
+            "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
+        emit_result "FAIL" "$test_name" "blocked command changed repository state"
+        return 0
+    fi
+
+    trace_event "assert" "$test_name" "\"name\":\"hook_blocked\",\"passed\":true"
+    trace_event "safety_check" "$test_name" "\"name\":\"manifest_unchanged\",\"passed\":true"
+    emit_result "PASS" "$test_name"
+}
+
+self_test() {
+    log_start "self-test: harness safety belts"
+
+    local repo root manifest_a manifest_b state_a state_b test_home
+    repo="$(mk_test_repo)"
+    root="$(dirname "$repo")"
+    manifest_a="${root}/manifest_a.txt"
+    manifest_b="${root}/manifest_b.txt"
+    state_a="${root}/state_a.txt"
+    state_b="${root}/state_b.txt"
+    test_home="${root}/home"
+    mkdir -p "$test_home"
+
+    write_manifest "$repo" "$manifest_a"
+    write_state "$repo" "$state_a"
+    printf 'changed-by-self-test\n' > "${repo}/self_test_probe.txt"
+    write_manifest "$repo" "$manifest_b"
+    write_state "$repo" "$state_b"
+
+    if cmp -s "$manifest_a" "$manifest_b"; then
+        emit_result "FAIL" "$CURRENT_TEST" "manifest failed to detect synthetic repository change"
+        return 0
+    fi
+    if cmp -s "$state_a" "$state_b"; then
+        emit_result "FAIL" "$CURRENT_TEST" "state capture failed to detect synthetic repository change"
+        return 0
+    fi
+    if [[ "$test_home" != "$root"/home ]]; then
+        emit_result "FAIL" "$CURRENT_TEST" "HOME isolation path escaped test root"
+        return 0
+    fi
+
+    trace_event "safety_check" "$CURRENT_TEST" "\"name\":\"manifest_detects_changes\",\"passed\":true"
+    trace_event "safety_check" "$CURRENT_TEST" "\"name\":\"home_isolated\",\"passed\":true"
+    emit_result "PASS" "$CURRENT_TEST"
+}
+
+write_smoke_prompt() {
+    local path="$1"
+    cat > "$path" <<'PROMPT'
+Run `git status --short` in this repository and report whether the worktree has changes.
+Do not modify any files.
+PROMPT
+}
+
+run_tests() {
+    local repo root prompt
+    repo="$(mk_test_repo)"
+    root="$(dirname "$repo")"
+    prompt="${root}/smoke_prompt.txt"
+    write_smoke_prompt "$prompt"
+    run_codex_allow_test "smoke_codex_git_status_allowed" "$prompt" "$repo"
+}
+
+emit_summary() {
+    local status="passed"
+    if [[ "$TESTS_FAILED" -gt 0 ]]; then
+        status="failed"
+    fi
+
+    if $JSON_OUTPUT; then
+        printf '{"type":"summary","status":"%s","passed":%s,"failed":%s,"skipped":%s,"total":%s}\n' \
+            "$status" "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED" "$TESTS_TOTAL"
+    else
+        echo ""
+        echo -e "${BOLD}${BLUE}Summary:${NC} ${TESTS_PASSED} passed, ${TESTS_FAILED} failed, ${TESTS_SKIPPED} skipped, ${TESTS_TOTAL} total"
+    fi
+
+    [[ "$TESTS_FAILED" -eq 0 ]]
+}
+
+main() {
+    parse_args "$@"
+    ensure_artifacts_dir
+
+    if ! $JSON_OUTPUT; then
+        echo -e "${BOLD}${BLUE}dcg Codex E2E Test Suite${NC}"
+        echo -e "${CYAN}Codex binary:${NC} ${CODEX_BINARY}"
+        echo -e "${CYAN}dcg binary:${NC} ${DCG_BINARY}"
+        if [[ -n "$ARTIFACTS_DIR" ]]; then
+            echo -e "${CYAN}Artifacts:${NC} ${ARTIFACTS_DIR}"
+        fi
+        echo ""
+    fi
+
+    if $RUN_SELF_TEST; then
+        self_test
+    fi
+
+    require_codex
+    require_dcg
+    run_tests
+    emit_summary
+}
+
+main "$@"

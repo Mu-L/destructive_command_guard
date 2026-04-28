@@ -493,6 +493,10 @@ pub struct EvaluationResult {
     /// Session occurrence snapshot (present when the command matched a pattern).
     /// Tracks how many times this command has been seen in the current process.
     pub session_occurrence: Option<crate::session::OccurrenceSnapshot>,
+    /// Graduated response level (present when graduation system is enabled).
+    pub graduated_response: Option<GraduatedResponse>,
+    /// How a soft block was bypassed (present when bypass occurred).
+    pub bypass_method: Option<BypassMethod>,
 }
 
 impl EvaluationResult {
@@ -508,6 +512,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -523,6 +529,8 @@ impl EvaluationResult {
             skipped_due_to_budget: true,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -548,6 +556,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -573,6 +583,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -599,6 +611,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -624,6 +638,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -656,6 +672,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -688,6 +706,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -723,6 +743,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -746,6 +768,8 @@ impl EvaluationResult {
             skipped_due_to_budget: false,
             branch_context: None,
             session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
         }
     }
 
@@ -782,6 +806,180 @@ impl EvaluationResult {
         self.pattern_info
             .as_ref()
             .and_then(|p| p.pack_id.as_deref())
+    }
+
+    /// Apply graduation logic based on session occurrence data.
+    ///
+    /// If the result has a session occurrence snapshot and a severity, computes
+    /// the graduated response. Does nothing if graduation is disabled or there
+    /// is no occurrence data.
+    pub fn apply_graduation(&mut self, config: &crate::config::ResponseConfig) {
+        if !config.is_enabled() {
+            return;
+        }
+        let session_count = match self.session_occurrence.as_ref() {
+            Some(snap) => snap.session_count,
+            None => return,
+        };
+        let severity = self
+            .pattern_info
+            .as_ref()
+            .and_then(|p| p.severity)
+            .unwrap_or(crate::packs::Severity::High);
+        self.graduated_response = determine_graduated_response(session_count, severity, config);
+    }
+
+    /// Record the command in session tracking and apply graduation.
+    ///
+    /// Convenience method that:
+    /// 1. Records the command occurrence via [`crate::session::record_and_snapshot`].
+    /// 2. Calls [`apply_graduation`](Self::apply_graduation).
+    pub fn record_and_graduate(&mut self, command: &str, config: &crate::config::ResponseConfig) {
+        if self.is_denied() {
+            let snap = crate::session::record_and_snapshot(command);
+            self.session_occurrence = Some(snap);
+            self.apply_graduation(config);
+        }
+    }
+}
+
+/// Response level from the graduation system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraduatedResponse {
+    /// Command seen before but below block threshold.
+    Warning { occurrence: u32 },
+    /// Session threshold reached; agent should reconsider (bypassable).
+    SoftBlock { occurrence: u32 },
+    /// Hard block; too many repeated attempts.
+    HardBlock { total_occurrences: u32 },
+}
+
+impl GraduatedResponse {
+    /// Whether this response blocks the command.
+    #[must_use]
+    pub const fn blocks(&self) -> bool {
+        matches!(self, Self::SoftBlock { .. } | Self::HardBlock { .. })
+    }
+
+    /// Whether this is an unbypassable hard block.
+    #[must_use]
+    pub const fn is_hard_block(&self) -> bool {
+        matches!(self, Self::HardBlock { .. })
+    }
+
+    /// The graduation mode that produced this response.
+    #[must_use]
+    pub fn decision_mode(&self) -> &'static str {
+        match self {
+            Self::Warning { .. } => "warning",
+            Self::SoftBlock { .. } => "soft_block",
+            Self::HardBlock { .. } => "hard_block",
+        }
+    }
+
+    /// Human-friendly label.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Warning { occurrence } => format!("warning (occurrence #{occurrence})"),
+            Self::SoftBlock { occurrence } => format!("soft block (occurrence #{occurrence})"),
+            Self::HardBlock { total_occurrences } => {
+                format!("hard block ({total_occurrences} total occurrences)")
+            }
+        }
+    }
+}
+
+/// How a soft block was bypassed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassMethod {
+    /// The `--force` flag was used.
+    Force,
+    /// An allow-once exception was granted.
+    AllowOnce,
+}
+
+impl BypassMethod {
+    /// Human-friendly label.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Force => "force",
+            Self::AllowOnce => "allow_once",
+        }
+    }
+}
+
+/// Determine the graduated response level from session occurrence count and config.
+///
+/// Uses the effective graduation mode for the given severity to decide thresholds.
+/// Returns `None` when graduation is disabled for this severity.
+#[must_use]
+pub fn determine_graduated_response(
+    session_count: u32,
+    severity: crate::packs::Severity,
+    config: &crate::config::ResponseConfig,
+) -> Option<GraduatedResponse> {
+    use crate::config::GraduationMode;
+
+    if !config.is_enabled() {
+        return None;
+    }
+
+    let mode = config.effective_mode(severity);
+
+    match mode {
+        GraduationMode::Disabled => None,
+        GraduationMode::WarningOnly => Some(GraduatedResponse::Warning {
+            occurrence: session_count,
+        }),
+        GraduationMode::Paranoid => {
+            // Paranoid: always hard block on first occurrence.
+            Some(GraduatedResponse::HardBlock {
+                total_occurrences: session_count,
+            })
+        }
+        GraduationMode::Strict => {
+            // Strict: warn=1, soft_block=1 (immediate soft block), hard_block at session_soft_block.
+            if session_count >= config.session_soft_block {
+                Some(GraduatedResponse::HardBlock {
+                    total_occurrences: session_count,
+                })
+            } else {
+                Some(GraduatedResponse::SoftBlock {
+                    occurrence: session_count,
+                })
+            }
+        }
+        GraduationMode::Standard => {
+            if session_count >= config.session_soft_block {
+                Some(GraduatedResponse::SoftBlock {
+                    occurrence: session_count,
+                })
+            } else if session_count >= config.session_warning_count {
+                Some(GraduatedResponse::Warning {
+                    occurrence: session_count,
+                })
+            } else {
+                None
+            }
+        }
+        GraduationMode::Lenient => {
+            // Lenient: double the standard thresholds.
+            let warn_threshold = config.session_warning_count.saturating_mul(2);
+            let soft_threshold = config.session_soft_block.saturating_mul(2);
+            if session_count >= soft_threshold {
+                Some(GraduatedResponse::SoftBlock {
+                    occurrence: session_count,
+                })
+            } else if session_count >= warn_threshold {
+                Some(GraduatedResponse::Warning {
+                    occurrence: session_count,
+                })
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -1032,6 +1230,14 @@ pub fn evaluate_command(
 #[inline]
 fn deadline_exceeded(deadline: Option<&Deadline>) -> bool {
     deadline.is_some_and(Deadline::is_exceeded)
+}
+
+#[inline]
+fn contains_shell_word_obfuscation(command: &str) -> bool {
+    command
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\\' | b'\'' | b'"'))
 }
 
 #[inline]
@@ -1312,8 +1518,20 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed_due_to_budget();
     }
 
-    // Step 4: Quick rejection - if no relevant keywords, allow immediately
-    if pack_aware_quick_reject(command, enabled_keywords) {
+    // Step 4: Quick rejection - if no relevant keywords, allow immediately.
+    //
+    // Fast path: when an Aho-Corasick keyword index is available, a single-pass
+    // AC scan (O(n)) replaces the N×memmem per-keyword scan. If the AC says no
+    // keyword appears in the raw command, we can skip the more expensive
+    // normalize+span-classify path in pack_aware_quick_reject entirely.
+    if let Some(index) = keyword_index {
+        if !index.has_any_keyword(command) && !contains_shell_word_obfuscation(command) {
+            if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
+                return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
+            }
+            return EvaluationResult::allowed();
+        }
+    } else if pack_aware_quick_reject(command, enabled_keywords) {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -1337,7 +1555,7 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     // Use the optimized version that returns both decision and normalized form.
     let (quick_reject, normalized) =
         pack_aware_quick_reject_with_normalized(command_for_match, enabled_keywords);
-    if matches!(sanitized, std::borrow::Cow::Owned(_)) && quick_reject {
+    if quick_reject {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -1506,7 +1724,7 @@ fn evaluate_packs_with_allowlists(
                 }
                 Some(crate::packs::core::filesystem::RmParseDecision::NoMatch) | None => {
                     // rm_parse didn't find rm command or wasn't computed, check safe patterns as fallback
-                    if pack.matches_safe(command_for_packs) {
+                    if pack.matches_safe_with_deadline(command_for_packs, deadline) {
                         continue;
                     }
                 }
@@ -1580,7 +1798,7 @@ fn evaluate_packs_with_allowlists(
             }
         } else {
             // Non-core.filesystem packs: check safe patterns before destructive
-            if pack.matches_safe(command_for_packs) {
+            if pack.matches_safe_with_deadline(command_for_packs, deadline) {
                 continue; // Safe pattern match - skip this pack's destructive patterns
             }
         }
@@ -1598,6 +1816,11 @@ fn evaluate_packs_with_allowlists(
                 .regex
                 .find(command_for_packs)
                 .map(|(start, end)| MatchSpan { start, end });
+
+            if deadline_exceeded(deadline) {
+                return EvaluationResult::allowed_due_to_budget();
+            }
+
             let Some(span) = matched_span else {
                 continue;
             };
@@ -1804,7 +2027,7 @@ where
     // Use the optimized version that returns both decision and normalized form.
     let (quick_reject, normalized) =
         pack_aware_quick_reject_with_normalized(command_for_match, enabled_keywords);
-    if matches!(sanitized, std::borrow::Cow::Owned(_)) && quick_reject {
+    if quick_reject {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -2037,66 +2260,82 @@ fn evaluate_heredoc(
         // If content is Bash, extract inner commands and feed them back to the full evaluator.
         // This ensures that `kubectl`, `docker`, etc. inside heredocs are checked against their packs.
         if content.language == crate::heredoc::ScriptLanguage::Bash {
-            let inner_commands = crate::heredoc::extract_shell_commands(&content.content);
-            for inner in inner_commands {
-                if deadline_exceeded(context.deadline) {
-                    return Some(EvaluationResult::allowed_due_to_budget());
-                }
+            // Fast pre-filter: skip the expensive tree-sitter AST parse if the
+            // heredoc body contains none of the enabled pack keywords. The AC
+            // automaton does a single O(n) scan; the AST parse is much heavier.
+            let body_has_keywords = context.keyword_index.map_or_else(
+                || {
+                    context.enabled_keywords.iter().any(|kw| {
+                        memchr::memmem::find(content.content.as_bytes(), kw.as_bytes()).is_some()
+                    })
+                },
+                |index| index.has_any_keyword(&content.content),
+            );
 
-                let result = evaluate_command_with_pack_order_deadline_at_path(
-                    &inner.text,
-                    context.enabled_keywords,
-                    context.ordered_packs,
-                    context.keyword_index,
-                    context.compiled_overrides,
-                    context.allowlists,
-                    context.heredoc_settings,
-                    context.allow_once_audit,
-                    context.project_path,
-                    context.deadline,
-                );
+            if body_has_keywords {
+                let inner_commands = crate::heredoc::extract_shell_commands(&content.content);
+                for inner in inner_commands {
+                    if deadline_exceeded(context.deadline) {
+                        return Some(EvaluationResult::allowed_due_to_budget());
+                    }
 
-                if result.is_denied() {
-                    // Propagate denial, wrapping the reason context
-                    if let Some(mut info) = result.pattern_info {
-                        info.reason = format!(
-                            "Embedded shell command blocked: {} (line {} of heredoc)",
-                            info.reason, inner.line_number
-                        );
-                        info.source = MatchSource::HeredocAst; // Mark as heredoc source
-                        if let Some(span) = info.matched_span {
-                            if let Some(mapped_inner) =
-                                map_heredoc_span(command, &content, inner.start, inner.end)
-                            {
-                                let mapped = MatchSpan {
-                                    start: mapped_inner.start.saturating_add(span.start),
-                                    end: mapped_inner.start.saturating_add(span.end),
-                                };
-                                if mapped.end <= command.len() {
-                                    info.matched_span = Some(mapped);
-                                    info.matched_text_preview =
-                                        Some(extract_match_preview(command, &mapped));
+                    let result = evaluate_command_with_pack_order_deadline_at_path(
+                        &inner.text,
+                        context.enabled_keywords,
+                        context.ordered_packs,
+                        context.keyword_index,
+                        context.compiled_overrides,
+                        context.allowlists,
+                        context.heredoc_settings,
+                        context.allow_once_audit,
+                        context.project_path,
+                        context.deadline,
+                    );
+
+                    if result.is_denied() {
+                        // Propagate denial, wrapping the reason context
+                        if let Some(mut info) = result.pattern_info {
+                            info.reason = format!(
+                                "Embedded shell command blocked: {} (line {} of heredoc)",
+                                info.reason, inner.line_number
+                            );
+                            info.source = MatchSource::HeredocAst; // Mark as heredoc source
+                            if let Some(span) = info.matched_span {
+                                if let Some(mapped_inner) =
+                                    map_heredoc_span(command, &content, inner.start, inner.end)
+                                {
+                                    let mapped = MatchSpan {
+                                        start: mapped_inner.start.saturating_add(span.start),
+                                        end: mapped_inner.start.saturating_add(span.end),
+                                    };
+                                    if mapped.end <= command.len() {
+                                        info.matched_span = Some(mapped);
+                                        info.matched_text_preview =
+                                            Some(extract_match_preview(command, &mapped));
+                                    } else {
+                                        info.matched_span = None;
+                                    }
                                 } else {
                                     info.matched_span = None;
                                 }
-                            } else {
-                                info.matched_span = None;
                             }
-                        }
 
-                        return Some(EvaluationResult {
-                            decision: EvaluationDecision::Deny,
-                            pattern_info: Some(info),
-                            allowlist_override: None,
-                            effective_mode: Some(crate::packs::DecisionMode::Deny),
-                            skipped_due_to_budget: false,
-                            branch_context: None,
-                            session_occurrence: None,
-                        });
+                            return Some(EvaluationResult {
+                                decision: EvaluationDecision::Deny,
+                                pattern_info: Some(info),
+                                allowlist_override: None,
+                                effective_mode: Some(crate::packs::DecisionMode::Deny),
+                                skipped_due_to_budget: false,
+                                branch_context: None,
+                                session_occurrence: None,
+                                graduated_response: None,
+                                bypass_method: None,
+                            });
+                        }
+                        return Some(result);
                     }
-                    return Some(result);
                 }
-            }
+            } // body_has_keywords
         }
 
         let matches = match DEFAULT_MATCHER.find_matches(&content.content, content.language) {
@@ -2174,6 +2413,8 @@ fn evaluate_heredoc(
                 skipped_due_to_budget: false,
                 branch_context: None,
                 session_occurrence: None,
+                graduated_response: None,
+                bypass_method: None,
             });
         }
     }
@@ -3563,6 +3804,121 @@ mod tests {
             assert!(result.allowlist_override.is_none());
             assert!(result.effective_mode.is_none());
         }
+
+        /// Safe pattern matching must respect deadline — a burst of backtracking
+        /// safe patterns should not run unbounded past the deadline.
+        #[test]
+        fn deadline_enforced_during_safe_pattern_matching() {
+            use crate::packs::Pack;
+
+            let mut safe_patterns = Vec::new();
+            for i in 0..20 {
+                safe_patterns.push(crate::packs::SafePattern {
+                    regex: crate::packs::regex_engine::LazyCompiledRegex::new(
+                        // Lookahead forces backtracking engine; nested quantifiers
+                        // cause worst-case backtracking on the adversarial input below.
+                        if i % 2 == 0 {
+                            r"(?=.*safe_cmd)(\w+\s+)*\w+"
+                        } else {
+                            r"(?=.*no_match_ever)(\w+\s+)*\w+"
+                        },
+                    ),
+                    name: "adversarial_safe",
+                });
+            }
+            let pack = Pack {
+                id: "test.adversarial".to_string(),
+                name: "adversarial",
+                description: "test pack",
+                keywords: &["rm"],
+                safe_patterns,
+                destructive_patterns: vec![crate::destructive_pattern!(
+                    "adversarial_rm",
+                    r"rm\b",
+                    "test destructive",
+                    High
+                )],
+                keyword_matcher: None,
+                safe_regex_set: None,
+                safe_regex_set_is_complete: false,
+            };
+
+            // Craft adversarial input: keyword match + repetitive whitespace tokens
+            // that cause exponential backtracking in (\w+\s+)*\w+
+            let adversarial = format!("rm {}", "a ".repeat(30));
+
+            // Zero-duration deadline should cause safe matching to bail out
+            let deadline = Deadline::new(Duration::ZERO);
+            let result = pack.matches_safe_with_deadline(&adversarial, Some(&deadline));
+            assert!(
+                !result,
+                "Should bail out (return false) when deadline exceeded during safe pattern scan"
+            );
+        }
+
+        /// Post-find deadline check: after a slow destructive regex.find(), the
+        /// evaluator should bail before processing the match result.
+        #[test]
+        fn deadline_enforced_after_destructive_regex_find() {
+            let compiled_overrides = default_compiled_overrides();
+            let allowlists = default_allowlists();
+            let heredoc_settings = test_heredoc_settings();
+            let enabled_keywords: Vec<&str> = vec!["rm"];
+            let ordered_packs: Vec<String> = vec!["core.filesystem".to_string()];
+            let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+
+            // Deadline that's already expired
+            let deadline = Deadline::new(Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(1));
+
+            let result = evaluate_command_with_pack_order_deadline(
+                "rm -rf /important",
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled_overrides,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                Some(&deadline),
+            );
+
+            assert!(result.is_allowed());
+            assert!(result.skipped_due_to_budget);
+        }
+
+        /// With a generous deadline, destructive commands should still be denied
+        /// even with backtracking patterns present — deadline enforcement must
+        /// not swallow legitimate matches.
+        #[test]
+        fn generous_deadline_still_denies_destructive() {
+            let compiled_overrides = default_compiled_overrides();
+            let allowlists = default_allowlists();
+            let heredoc_settings = test_heredoc_settings();
+            let enabled_keywords: Vec<&str> = vec!["git"];
+            let ordered_packs: Vec<String> = vec!["core.git".to_string()];
+            let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+
+            let deadline = Deadline::new(Duration::from_secs(30));
+
+            let result = evaluate_command_with_pack_order_deadline(
+                "git reset --hard HEAD~5",
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled_overrides,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                Some(&deadline),
+            );
+
+            assert!(
+                result.is_denied(),
+                "Generous deadline should still deny destructive commands"
+            );
+            assert!(!result.skipped_due_to_budget);
+        }
     }
 
     #[test]
@@ -3900,6 +4256,8 @@ mod tests {
                 skipped_due_to_budget: false,
                 branch_context: None,
                 session_occurrence: None,
+                graduated_response: None,
+                bypass_method: None,
             }
         }
 
@@ -4072,6 +4430,8 @@ mod tests {
                 effective_mode: None,
                 skipped_due_to_budget: false,
                 session_occurrence: None,
+                graduated_response: None,
+                bypass_method: None,
             };
 
             // Applying branch strictness at a non-git path should return unchanged result
@@ -4346,6 +4706,254 @@ mod tests {
             assert!(
                 result.is_allowed(),
                 "safe heredoc content should be allowed"
+            );
+        }
+    }
+
+    mod graduation_tests {
+        use super::*;
+        use crate::config::{GraduationMode, ResponseConfig, SeverityOverrides};
+        use crate::packs::Severity;
+
+        fn enabled_config() -> ResponseConfig {
+            ResponseConfig {
+                enabled: true,
+                ..ResponseConfig::default()
+            }
+        }
+
+        #[test]
+        fn disabled_config_returns_none() {
+            let config = ResponseConfig::default(); // enabled = false
+            let result = determine_graduated_response(5, Severity::High, &config);
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn disabled_mode_returns_none() {
+            let mut config = enabled_config();
+            config.mode = GraduationMode::Disabled;
+            let result = determine_graduated_response(5, Severity::Medium, &config);
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn warning_only_always_warns() {
+            let mut config = enabled_config();
+            config.mode = GraduationMode::WarningOnly;
+            for count in [1, 5, 100] {
+                let result =
+                    determine_graduated_response(count, Severity::Medium, &config).unwrap();
+                assert!(
+                    matches!(result, GraduatedResponse::Warning { .. }),
+                    "WarningOnly should always warn, got {:?}",
+                    result
+                );
+            }
+        }
+
+        #[test]
+        fn paranoid_always_hard_blocks() {
+            let mut config = enabled_config();
+            config.mode = GraduationMode::Paranoid;
+            let result = determine_graduated_response(1, Severity::Medium, &config).unwrap();
+            assert!(matches!(result, GraduatedResponse::HardBlock { .. }));
+        }
+
+        #[test]
+        fn standard_mode_progression() {
+            let config = enabled_config();
+            // session_warning_count=1, session_soft_block=2
+
+            // count=1 -> Warning
+            let r = determine_graduated_response(1, Severity::High, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::Warning { occurrence: 1 }));
+
+            // count=2 -> SoftBlock
+            let r = determine_graduated_response(2, Severity::High, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::SoftBlock { occurrence: 2 }));
+
+            // count=5 -> SoftBlock (still)
+            let r = determine_graduated_response(5, Severity::High, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::SoftBlock { occurrence: 5 }));
+        }
+
+        #[test]
+        fn strict_mode_immediate_soft_block() {
+            let mut config = enabled_config();
+            config.mode = GraduationMode::Strict;
+            // count=1 -> SoftBlock (immediate)
+            let r = determine_graduated_response(1, Severity::Medium, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::SoftBlock { .. }));
+            // count=session_soft_block -> HardBlock
+            let r =
+                determine_graduated_response(config.session_soft_block, Severity::Medium, &config)
+                    .unwrap();
+            assert!(matches!(r, GraduatedResponse::HardBlock { .. }));
+        }
+
+        #[test]
+        fn lenient_mode_doubles_thresholds() {
+            let mut config = enabled_config();
+            config.mode = GraduationMode::Lenient;
+            // Default: session_warning_count=1, session_soft_block=2
+            // Lenient doubles: warn at 2, soft_block at 4
+
+            // count=1 -> None (below doubled warning threshold)
+            let r = determine_graduated_response(1, Severity::Medium, &config);
+            assert!(r.is_none());
+
+            // count=2 -> Warning
+            let r = determine_graduated_response(2, Severity::Medium, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::Warning { .. }));
+
+            // count=4 -> SoftBlock
+            let r = determine_graduated_response(4, Severity::Medium, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::SoftBlock { .. }));
+        }
+
+        #[test]
+        fn severity_defaults_for_critical_and_low() {
+            let config = enabled_config();
+            // Critical defaults to Paranoid -> HardBlock
+            let r = determine_graduated_response(1, Severity::Critical, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::HardBlock { .. }));
+            // Low defaults to WarningOnly -> Warning
+            let r = determine_graduated_response(1, Severity::Low, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::Warning { .. }));
+        }
+
+        #[test]
+        fn severity_override_takes_precedence() {
+            let mut config = enabled_config();
+            config.severity_overrides = SeverityOverrides {
+                critical: Some(GraduationMode::WarningOnly),
+                high: None,
+                medium: None,
+                low: Some(GraduationMode::Paranoid),
+            };
+            // Critical overridden to WarningOnly
+            let r = determine_graduated_response(1, Severity::Critical, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::Warning { .. }));
+            // Low overridden to Paranoid
+            let r = determine_graduated_response(1, Severity::Low, &config).unwrap();
+            assert!(matches!(r, GraduatedResponse::HardBlock { .. }));
+        }
+
+        #[test]
+        fn apply_graduation_on_denied_result() {
+            let mut config = enabled_config();
+            config.session_warning_count = 1;
+            let mut result = EvaluationResult::denied_by_pack_pattern(
+                "core.git",
+                "reset-hard",
+                "Destroys uncommitted changes",
+                None,
+                Severity::High,
+                &[],
+            );
+            result.session_occurrence = Some(crate::session::OccurrenceSnapshot {
+                command_hash: "abc".to_string(),
+                session_count: 1,
+                distinct_commands: 1,
+                total_occurrences: 1,
+            });
+            result.apply_graduation(&config);
+            assert!(result.graduated_response.is_some());
+            assert!(matches!(
+                result.graduated_response,
+                Some(GraduatedResponse::Warning { occurrence: 1 })
+            ));
+        }
+
+        #[test]
+        fn apply_graduation_skipped_when_disabled() {
+            let config = ResponseConfig::default(); // enabled=false
+            let mut result = EvaluationResult::denied_by_pack("test", "reason", None);
+            result.session_occurrence = Some(crate::session::OccurrenceSnapshot {
+                command_hash: "abc".to_string(),
+                session_count: 5,
+                distinct_commands: 1,
+                total_occurrences: 5,
+            });
+            result.apply_graduation(&config);
+            assert!(result.graduated_response.is_none());
+        }
+
+        #[test]
+        fn apply_graduation_no_occurrence_data() {
+            let config = enabled_config();
+            let mut result = EvaluationResult::denied_by_pack("test", "reason", None);
+            // No session_occurrence set
+            result.apply_graduation(&config);
+            assert!(result.graduated_response.is_none());
+        }
+
+        #[test]
+        fn graduated_response_blocks() {
+            assert!(!GraduatedResponse::Warning { occurrence: 1 }.blocks());
+            assert!(GraduatedResponse::SoftBlock { occurrence: 2 }.blocks());
+            assert!(
+                GraduatedResponse::HardBlock {
+                    total_occurrences: 5
+                }
+                .blocks()
+            );
+        }
+
+        #[test]
+        fn graduated_response_is_hard_block() {
+            assert!(!GraduatedResponse::Warning { occurrence: 1 }.is_hard_block());
+            assert!(!GraduatedResponse::SoftBlock { occurrence: 2 }.is_hard_block());
+            assert!(
+                GraduatedResponse::HardBlock {
+                    total_occurrences: 5
+                }
+                .is_hard_block()
+            );
+        }
+
+        #[test]
+        fn graduated_response_labels() {
+            assert_eq!(
+                GraduatedResponse::Warning { occurrence: 3 }.label(),
+                "warning (occurrence #3)"
+            );
+            assert_eq!(
+                GraduatedResponse::SoftBlock { occurrence: 2 }.label(),
+                "soft block (occurrence #2)"
+            );
+            assert_eq!(
+                GraduatedResponse::HardBlock {
+                    total_occurrences: 5
+                }
+                .label(),
+                "hard block (5 total occurrences)"
+            );
+        }
+
+        #[test]
+        fn bypass_method_labels() {
+            assert_eq!(BypassMethod::Force.label(), "force");
+            assert_eq!(BypassMethod::AllowOnce.label(), "allow_once");
+        }
+
+        #[test]
+        fn decision_mode_strings() {
+            assert_eq!(
+                GraduatedResponse::Warning { occurrence: 1 }.decision_mode(),
+                "warning"
+            );
+            assert_eq!(
+                GraduatedResponse::SoftBlock { occurrence: 1 }.decision_mode(),
+                "soft_block"
+            );
+            assert_eq!(
+                GraduatedResponse::HardBlock {
+                    total_occurrences: 1
+                }
+                .decision_mode(),
+                "hard_block"
             );
         }
     }

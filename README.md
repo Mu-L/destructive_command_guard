@@ -679,7 +679,7 @@ The installer also verifies Sigstore cosign bundles when available (falls back t
 
 - **Aider:** No PreToolUse-style interception. The installer enables `git-commit-verify: true` in `~/.aider.conf.yml` so git hooks run. For full protection, install dcg as a [git pre-commit hook](docs/scan-precommit-guide.md).
 - **Continue:** No shell command interception hooks. The installer detects Continue but cannot auto-configure protection. Use a [git pre-commit hook](docs/scan-precommit-guide.md) instead.
-- **Codex CLI:** PreToolUse hooks via `~/.codex/hooks.json` (stable in codex 0.125.0+; the `codex_hooks` feature is on by default). Codex's hook input shape mirrors Claude Code's, but its JSON deny parser is strict (`#[serde(deny_unknown_fields)]`), so dcg detects Codex from the `turn_id` stdin field (codex's documented extension over Claude's hook spec) and switches to Codex's documented exit-2 + stderr deny path; the colored block message goes to stderr where codex shows it to the model. See the [Codex integration notes](docs/codex-integration.md). Caveat: the model can still write scripts to disk to bypass hook-based blocking.
+- **Codex CLI:** PreToolUse hooks via `~/.codex/hooks.json` (stable in codex 0.125.0+; the `codex_hooks` feature is on by default). Codex's hook input shape mirrors Claude Code's, but its JSON deny parser is strict (`#[serde(deny_unknown_fields)]`), so dcg detects Codex from the `turn_id` stdin field (codex's documented extension over Claude's hook spec) and switches to Codex's documented exit-2 + stderr deny path; the colored block message goes to stderr where codex shows it to the model. See the [Codex integration notes](docs/codex-integration.md). Caveat: the model can still write scripts to disk to bypass hook-based blocking. **Windows note:** `install.ps1` does not yet auto-configure Codex hooks — it only configures Claude Code. Windows users should manually create `%USERPROFILE%\.codex\hooks.json` with the same shape as shown [above](#easy-mode-install) (using backslash-escaped paths to `dcg.exe`). An `uninstall.ps1` does not exist yet either.
 - **GitHub Copilot CLI:** Hooks are repository-local (`.github/hooks/*.json`). Run the installer from each repository where you want protection.
 - **OpenCode:** Not auto-configured. Requires a Bun-based plugin with `"tool.execute.before"` hook key. A working community plugin: [aspiers/ai-config/dcg-guard.js](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js).
 
@@ -2246,6 +2246,21 @@ The repository includes a comprehensive E2E test script with hundreds of command
 # With specific binary path
 ./scripts/e2e_test.sh --binary ./target/release/dcg
 ```
+
+Codex CLI integration has a separate opt-in harness because it drives a real
+authenticated `codex exec` session against hermetic temporary repositories:
+
+```bash
+# Run the real Codex CLI smoke harness
+./scripts/e2e_codex.sh --verbose --dcg-binary ./target/release/dcg
+
+# Capture JSONL trace and failure artifacts for postmortems
+./scripts/e2e_codex.sh --json --artifacts ./artifacts/codex-e2e --dcg-binary ./target/release/dcg
+```
+
+The Codex harness exits successfully with an explicit skipped status when Codex
+is unavailable or unauthenticated, so CI and developer machines without Codex
+access can run it without producing false failures.
 
 The E2E suite covers:
 - All destructive git commands (reset, checkout, restore, clean, push, branch, stash)
