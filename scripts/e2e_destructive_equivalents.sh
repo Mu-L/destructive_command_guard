@@ -509,9 +509,80 @@ scenario_shred_bypass_var() {
 }
 
 # ---------------------------------------------------------------------------
+# tar --remove-files (git_safety_guard-nqhi.6)
+# ---------------------------------------------------------------------------
+scenario_tar_remove_files_root_home() {
+    # Flag-then-source.
+    assert_blocked 'tar --remove-files -cf out.tar /etc'              'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked 'tar --remove-files -czf out.tar.gz /home/user'    'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked 'tar --remove-files -cf out.tar /usr/local'        'core.filesystem:tar-remove-files-root-home' 'critical'
+    # Source-then-flag (order-agnostic).
+    assert_blocked 'tar -cf out.tar --remove-files /etc'              'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked 'tar -cf out.tar /etc --remove-files'              'core.filesystem:tar-remove-files-root-home' 'critical'
+    # Delete-only (archive discarded to /dev/null).
+    assert_blocked 'tar --remove-files -cf /dev/null /etc'            'core.filesystem:tar-remove-files-root-home' 'critical'
+    # Quoted sensitive paths.
+    assert_blocked 'tar --remove-files -cf out.tar "/etc"'            'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked "tar --remove-files -cf out.tar '/etc'"            'core.filesystem:tar-remove-files-root-home' 'critical'
+    # Home variants.
+    assert_blocked 'tar --remove-files -cf out.tar ~/.ssh'            'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked 'tar --remove-files -cf out.tar $HOME/.aws'        'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked 'tar --remove-files -cf out.tar ${HOME}/.gnupg'    'core.filesystem:tar-remove-files-root-home' 'critical'
+    # Compound forms (\btar\b matches at any boundary).
+    assert_blocked 'echo done; tar --remove-files -cf out.tar /etc'   'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked 'true && tar --remove-files -cf out.tar /etc'      'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked '(tar --remove-files -cf out.tar /etc)'            'core.filesystem:tar-remove-files-root-home' 'critical'
+    # Wrappers (sudo/env stripped).
+    assert_blocked 'sudo tar --remove-files -cf out.tar /etc'         'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked 'env FOO=bar tar --remove-files -cf out.tar /etc'  'core.filesystem:tar-remove-files-root-home' 'critical'
+    # Path-prefixed (PATH_NORMALIZER).
+    assert_blocked '/usr/bin/tar --remove-files -cf out.tar /etc'     'core.filesystem:tar-remove-files-root-home' 'critical'
+    assert_blocked '/bin/tar --remove-files -cf out.tar /etc'         'core.filesystem:tar-remove-files-root-home' 'critical'
+    # Mixed-source: a /tmp source does NOT rescue when an /etc co-source
+    # is also present — root-home must still fire.
+    assert_blocked 'tar --remove-files -cf out.tar /tmp/foo /etc/bar' 'core.filesystem:tar-remove-files-root-home' 'critical'
+}
+
+scenario_tar_remove_files_general() {
+    assert_blocked 'tar --remove-files -cf out.tar ./build'           'core.filesystem:tar-remove-files-general' 'high'
+    assert_blocked 'tar --remove-files -cf out.tar important.db'      'core.filesystem:tar-remove-files-general' 'high'
+    assert_blocked 'tar -cf out.tar --remove-files data.json'         'core.filesystem:tar-remove-files-general' 'high'
+    assert_blocked 'tar --remove-files -cf out.tar /data/important'   'core.filesystem:tar-remove-files-general' 'high'
+}
+
+scenario_tar_remove_files_temp_safe() {
+    assert_allowed 'tar --remove-files -cf out.tar /tmp/scratch'
+    assert_allowed 'tar -cf out.tar --remove-files /tmp/foo'
+    assert_allowed 'tar --remove-files -czf out.tar.gz /var/tmp/cache'
+    assert_allowed 'tar --remove-files -cf out.tar $TMPDIR/scratch'
+    assert_allowed 'tar --remove-files -cf out.tar ${TMPDIR}/scratch'
+}
+
+scenario_tar_no_false_positive() {
+    # No --remove-files means no destruction trigger.
+    assert_allowed 'tar -cf out.tar /etc'
+    assert_allowed 'tar -czf out.tar.gz /home/user'
+    assert_allowed 'tar -xf in.tar'
+    assert_allowed 'tar -xzf in.tar.gz -C /tmp'
+    assert_allowed 'tar -tf in.tar'
+    assert_allowed 'tar --help'
+    assert_allowed 'tar --version'
+    # Substring traps.
+    assert_allowed 'cat tar-readme.md'
+    assert_allowed 'ls /etc/tar-config'
+    # `--remove-files` mentioned but not as a tar flag (no `tar` invocation).
+    assert_allowed 'echo --remove-files'
+}
+
+scenario_tar_remove_files_bypass_var() {
+    assert_blocked_under_falsy_bypass  'tar --remove-files -cf out.tar /etc'      'core.filesystem:tar-remove-files-root-home'
+    assert_blocked_under_falsy_bypass  'tar --remove-files -cf /dev/null /etc'    'core.filesystem:tar-remove-files-root-home'
+    assert_allowed_under_truthy_bypass 'tar --remove-files -cf out.tar /etc'
+}
+
+# ---------------------------------------------------------------------------
 # (placeholders — implementers replace with concrete assertions)
 # scenario_dd_*() { :; }
-# scenario_tar_remove_files_*() { :; }
 # scenario_redirect_*() { :; }
 # scenario_mv_sensitive_*() { :; }
 # scenario_system_disk_default() { :; }

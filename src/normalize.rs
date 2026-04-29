@@ -851,8 +851,10 @@ pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
 pub static QUOTED_PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
     // Matches quoted paths like "C:/Program Files/Git/bin/git.exe" or "/usr/bin/git"
     // Note: Uses [^"]+ to match path content (may include spaces)
-    Regex::new(r#"^"(?:[^"]+/|[A-Za-z]:[^"]+[/\\])(rm|git|find|unlink|truncate|shred|tar)(?:\.exe)?""#)
-        .unwrap()
+    Regex::new(
+        r#"^"(?:[^"]+/|[A-Za-z]:[^"]+[/\\])(rm|git|find|unlink|truncate|shred|tar)(?:\.exe)?""#,
+    )
+    .unwrap()
 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

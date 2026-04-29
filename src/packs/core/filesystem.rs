@@ -1285,9 +1285,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // this rule because the regex doesn't position-parse `-cf`'s
         // argument. Accepted: writing tar archives to /etc is itself
         // suspicious and `dcg allow-once` covers the rare legitimate case.
+        // Path-tail terminator set includes `)` (in addition to the
+        // standard `\s|$|['"]`) so a subshell form like
+        // `(tar --remove-files -cf out.tar /etc)` — where /etc is the
+        // last token before the closing paren — still classifies as
+        // Critical (root-home) rather than falling through to the
+        // High-tier general rule. The other sibling rules (rm-rf,
+        // find-delete, unlink, truncate-zero, shred) have the same
+        // latent gap; closing it pack-wide is tracked separately.
         destructive_pattern!(
             "tar-remove-files-root-home",
-            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
+            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
             "tar --remove-files on a sensitive system or home path is recursive deletion masquerading as an archive operation. EXTREMELY DANGEROUS.",
             Critical,
             "`tar --remove-files -cf <archive> <source>` first archives the source paths \

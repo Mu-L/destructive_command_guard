@@ -13,9 +13,17 @@
         "keywords_checked": [
           "/find",
           "/rm",
+          "/shred",
+          "/tar",
+          "/truncate",
+          "/unlink",
           "find",
           "git",
-          "rm"
+          "rm",
+          "shred",
+          "tar",
+          "truncate",
+          "unlink"
         ],
         "first_match": null
       }

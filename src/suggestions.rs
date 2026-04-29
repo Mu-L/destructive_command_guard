@@ -501,7 +501,10 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         "core.filesystem:tar-remove-files-root-home",
         rm_rf_suggestions.clone(),
     );
-    m.insert("core.filesystem:tar-remove-files-general", rm_rf_suggestions);
+    m.insert(
+        "core.filesystem:tar-remove-files-general",
+        rm_rf_suggestions,
+    );
 }
 
 /// Register suggestions for heredoc pattern rules.
