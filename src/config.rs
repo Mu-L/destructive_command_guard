@@ -3827,12 +3827,15 @@ disabled = [
 ]
 
 # Load custom packs from YAML files.
-# Supports glob patterns and ~ for home directory.
+# Supports glob patterns, ~ for home directory, and ${repo_root} for the
+# nearest ancestor of cwd containing a .git directory. ${repo_root} entries
+# are silently skipped when cwd is outside any repo, so a config that
+# auto-discovers repo-local packs is safe to deploy via MDM.
 # See docs/custom-packs.md for pack authoring guide.
 custom_paths = [
-    # "~/.config/dcg/packs/*.yaml",      # User packs
-    # ".dcg/packs/*.yaml",               # Project-local packs
-    # "/etc/dcg/packs/*.yaml",           # System-wide packs
+    # "~/.config/dcg/packs/*.yaml",         # User packs
+    # "${repo_root}/.dcg/packs/*.yaml",     # Repo-local packs (auto-discovered)
+    # "/etc/dcg/packs/*.yaml",              # System-wide packs
 ]
 
 #─────────────────────────────────────────────────────────────
@@ -7538,5 +7541,48 @@ low = "disabled"
         assert!(sample.contains("mode = \"standard\""));
         // Ensure it still parses
         toml::from_str::<Config>(&sample).expect("sample config with [response] parses");
+    }
+
+    #[test]
+    fn test_expand_custom_paths_repo_root_token() {
+        // Build a temp repo with a .git marker and a pack file inside it.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".dcg/packs")).unwrap();
+        std::fs::write(repo.join(".dcg/packs/team.yaml"), "# pack").unwrap();
+
+        // cwd is a subdirectory of the repo — walk-up should find the root.
+        let subdir = repo.join("a/b/c");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let packs = PacksConfig {
+            custom_paths: vec!["${repo_root}/.dcg/packs/*.yaml".to_string()],
+            ..PacksConfig::default()
+        };
+
+        let resolved = packs.expand_custom_paths_from(Some(&subdir));
+        assert_eq!(resolved.len(), 1, "should resolve one pack file");
+        assert!(resolved[0].ends_with("team.yaml"));
+    }
+
+    #[test]
+    fn test_expand_custom_paths_repo_root_no_repo() {
+        // cwd is outside any repo — entry referencing ${repo_root} should silently skip.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let nonrepo = tmp.path().join("nonrepo");
+        std::fs::create_dir_all(&nonrepo).unwrap();
+
+        let packs = PacksConfig {
+            custom_paths: vec![
+                "${repo_root}/.dcg/packs/*.yaml".to_string(),
+                // Literal entry without the token still resolves normally.
+                tmp.path().join("nope.yaml").to_string_lossy().into_owned(),
+            ],
+            ..PacksConfig::default()
+        };
+
+        let resolved = packs.expand_custom_paths_from(Some(&nonrepo));
+        assert!(resolved.is_empty(), "no repo root → token entry skipped, literal missing → empty");
     }
 }
