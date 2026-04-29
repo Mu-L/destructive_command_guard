@@ -1143,31 +1143,58 @@ impl PacksConfig {
         enabled
     }
 
-    /// Expand custom_paths, resolving tilde and glob patterns.
+    /// Expand custom_paths, resolving tilde, ${repo_root}, and glob patterns.
     ///
     /// Returns a list of concrete file paths that exist on disk.
     /// Invalid globs or non-existent files are silently skipped (fail-open).
+    ///
+    /// `${repo_root}` resolves to the nearest ancestor of the process cwd
+    /// that contains a `.git` directory. When no repo root is found, entries
+    /// referencing the token are skipped (so a config that auto-discovers
+    /// repo-local packs is safe to deploy globally via MDM and just no-ops
+    /// outside checkouts).
     #[must_use]
     pub fn expand_custom_paths(&self) -> Vec<String> {
+        let cwd = std::env::current_dir().ok();
+        self.expand_custom_paths_from(cwd.as_deref())
+    }
+
+    /// `expand_custom_paths` with an explicit cwd, for testability.
+    #[must_use]
+    pub fn expand_custom_paths_from(&self, cwd: Option<&Path>) -> Vec<String> {
         let mut result = Vec::new();
+        let mut repo_root: Option<Option<PathBuf>> = None; // memoize across patterns
 
         for pattern in &self.custom_paths {
-            // Expand tilde first
-            let expanded = if pattern.starts_with("~/") || pattern == "~" {
-                if let Some(home) = dirs::home_dir() {
-                    if pattern == "~" {
-                        home.to_string_lossy().into_owned()
-                    } else {
-                        home.join(&pattern[2..]).to_string_lossy().into_owned()
-                    }
-                } else {
-                    pattern.clone()
-                }
+            // Expand ${repo_root} first — if unresolved, skip the entry.
+            let after_repo_root = if pattern.contains("${repo_root}") {
+                let resolved = repo_root.get_or_insert_with(|| {
+                    cwd.and_then(|c| find_repo_root(c, REPO_ROOT_SEARCH_MAX_HOPS))
+                });
+                let Some(root) = resolved.as_ref() else {
+                    continue;
+                };
+                pattern.replace("${repo_root}", &root.to_string_lossy())
             } else {
                 pattern.clone()
             };
 
-            // Expand glob pattern
+            // Then expand tilde.
+            let expanded = if after_repo_root.starts_with("~/") || after_repo_root == "~" {
+                if let Some(home) = dirs::home_dir() {
+                    if after_repo_root == "~" {
+                        home.to_string_lossy().into_owned()
+                    } else {
+                        home.join(&after_repo_root[2..]).to_string_lossy().into_owned()
+                    }
+                } else {
+                    after_repo_root
+                }
+            } else {
+                after_repo_root
+            };
+
+            // Expand glob pattern.
             match glob::glob(&expanded) {
                 Ok(paths) => {
                     for entry in paths.flatten() {
