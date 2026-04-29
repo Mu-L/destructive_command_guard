@@ -75,3 +75,9 @@ hello_write.txt
 
 # Agent mail project identity
 .agent-mail-project-id
+
+# Beads write lock (per-process, regenerated on each br invocation)
+.beads/.write.lock
+
+# E2E test run logs
+e2e_*.log
