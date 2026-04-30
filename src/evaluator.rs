@@ -814,6 +814,19 @@ impl EvaluationResult {
     /// the graduated response. Does nothing if graduation is disabled or there
     /// is no occurrence data.
     pub fn apply_graduation(&mut self, config: &crate::config::ResponseConfig) {
+        self.apply_graduation_with_history_count(None, config);
+    }
+
+    /// Same as [`apply_graduation`] but also feeds an optional cross-session
+    /// `history_count` (occurrences of this command's `command_hash` blocked
+    /// within `config.history_window`) into the graduation computation.
+    /// Standard/Lenient mode escalates based on whichever signal — session
+    /// or history — is stronger. Pass `None` to keep the previous behavior.
+    pub fn apply_graduation_with_history_count(
+        &mut self,
+        history_count: Option<u32>,
+        config: &crate::config::ResponseConfig,
+    ) {
         if !config.is_enabled() {
             return;
         }
@@ -826,7 +839,37 @@ impl EvaluationResult {
             .as_ref()
             .and_then(|p| p.severity)
             .unwrap_or(crate::packs::Severity::High);
-        self.graduated_response = determine_graduated_response(session_count, severity, config);
+        self.graduated_response = determine_graduated_response_with_history(
+            session_count,
+            history_count,
+            severity,
+            config,
+        );
+    }
+
+    /// Convenience: query the supplied [`HistoryDb`] for the number of
+    /// times this command's `command_hash` was blocked within
+    /// `config.history_window`, then apply graduation. On any history
+    /// query error, falls back to session-only graduation (fail-open) so
+    /// the hot path never errors out.
+    pub fn apply_graduation_with_history_db(
+        &mut self,
+        command: &str,
+        history: &crate::history::HistoryDb,
+        config: &crate::config::ResponseConfig,
+    ) {
+        if !config.is_enabled() {
+            return;
+        }
+        let window = config.history_window_duration();
+        let history_count = match history.count_command_blocks_in_window(command, window) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::debug!(error = %e, "history count query failed; falling back to session-only graduation");
+                None
+            }
+        };
+        self.apply_graduation_with_history_count(history_count, config);
     }
 
     /// Record the command in session tracking and apply graduation.
@@ -943,6 +986,31 @@ pub fn determine_graduated_response(
     severity: crate::packs::Severity,
     config: &crate::config::ResponseConfig,
 ) -> Option<GraduatedResponse> {
+    determine_graduated_response_with_history(session_count, None, severity, config)
+}
+
+/// History-aware variant of [`determine_graduated_response`].
+///
+/// Also consults `history_count` (occurrences of this command's
+/// `command_hash` blocked within `config.history_window`). When provided,
+/// Standard/Lenient mode escalates based on whichever signal is louder:
+///
+/// - `history_count >= history_hard_block` → `HardBlock`
+/// - `history_count >= history_soft_block` → `SoftBlock`
+/// - otherwise: existing session-only logic
+///
+/// Paranoid / WarningOnly / Strict / Disabled are unaffected — they don't
+/// have escalation tiers driven by occurrence count.
+///
+/// Callers without history-DB access pass `None` for `history_count`; the
+/// behavior matches the pre-wiring evaluator exactly.
+#[must_use]
+pub fn determine_graduated_response_with_history(
+    session_count: u32,
+    history_count: Option<u32>,
+    severity: crate::packs::Severity,
+    config: &crate::config::ResponseConfig,
+) -> Option<GraduatedResponse> {
     use crate::config::GraduationMode;
 
     if !config.is_enabled() {
@@ -951,7 +1019,26 @@ pub fn determine_graduated_response(
 
     let mode = config.effective_mode(severity);
 
-    match mode {
+    // For Standard/Lenient, history thresholds can lift the response above
+    // what session_count alone would warrant. Compute the history tier first
+    // so callers see the strictest applicable response.
+    let history_tier = history_count.and_then(|hc| {
+        if matches!(mode, GraduationMode::Standard | GraduationMode::Lenient) {
+            if hc >= config.history_hard_block {
+                Some(GraduatedResponse::HardBlock {
+                    total_occurrences: hc,
+                })
+            } else if hc >= config.history_soft_block {
+                Some(GraduatedResponse::SoftBlock { occurrence: hc })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
+    let session_tier = match mode {
         GraduationMode::Disabled => None,
         GraduationMode::WarningOnly => Some(GraduatedResponse::Warning {
             occurrence: session_count,
@@ -1006,7 +1093,25 @@ pub fn determine_graduated_response(
                 None
             }
         }
+    };
+
+    // Pick the strictest applicable response: HardBlock > SoftBlock > Warning.
+    match (history_tier, session_tier) {
+        (Some(h), Some(s)) => Some(strictest(h, s)),
+        (Some(h), None) => Some(h),
+        (None, s) => s,
     }
+}
+
+fn strictest(a: GraduatedResponse, b: GraduatedResponse) -> GraduatedResponse {
+    fn rank(r: &GraduatedResponse) -> u8 {
+        match r {
+            GraduatedResponse::Warning { .. } => 1,
+            GraduatedResponse::SoftBlock { .. } => 2,
+            GraduatedResponse::HardBlock { .. } => 3,
+        }
+    }
+    if rank(&a) >= rank(&b) { a } else { b }
 }
 
 // =============================================================================
@@ -1748,10 +1853,23 @@ fn evaluate_packs_with_allowlists(
         // This prevents compound command bypass where one pack's safe pattern
         // would whitelist destructive commands from other packs.
         if pack_id == "core.filesystem" {
+            let has_pre_rm_propagation_match = pack.destructive_patterns.iter().any(|pattern| {
+                crate::packs::core::filesystem::is_pre_rm_propagation_rule(pattern.name)
+                    && pattern.regex.is_match(command_for_packs)
+            });
+
             // core.filesystem uses rm_parse for more accurate safe pattern detection
             match rm_parse.as_ref() {
-                Some(crate::packs::core::filesystem::RmParseDecision::Allow) => {
+                Some(crate::packs::core::filesystem::RmParseDecision::Allow)
+                    if !has_pre_rm_propagation_match =>
+                {
                     continue; // Safe pattern match - skip this pack
+                }
+                Some(crate::packs::core::filesystem::RmParseDecision::Allow) => {
+                    // A sensitive-source propagation chain matched before the rm
+                    // fast path. Fall through to the ordinary destructive-pattern
+                    // loop so allowlists, spans, explanations, and suggestions are
+                    // handled consistently.
                 }
                 Some(crate::packs::core::filesystem::RmParseDecision::NoMatch) | None => {
                     // rm_parse didn't find rm command or wasn't computed, check safe patterns as fallback
@@ -2751,6 +2869,7 @@ pub fn apply_branch_strictness(
     };
 
     // Extract branch name if available
+    let is_detached_head = matches!(&branch_info, crate::git::BranchInfo::DetachedHead(_));
     let branch_name = match &branch_info {
         crate::git::BranchInfo::Branch(name) => Some(name.clone()),
         crate::git::BranchInfo::DetachedHead(_) => None,
@@ -2776,7 +2895,15 @@ pub fn apply_branch_strictness(
     let is_relaxed = branch_name
         .as_ref()
         .is_some_and(|name| git_awareness.is_relaxed_branch(Some(name.as_str())));
-    let strictness = git_awareness.strictness_for_branch(branch_name.as_deref());
+    // Detached HEAD (rebase / bisect / checkout-tag) gets its own strictness
+    // knob — defaults to All. Without this branch, detached HEAD silently fell
+    // back to default_strictness (typically High), missing the very contexts
+    // where uncommitted work is most exposed.
+    let strictness = if is_detached_head {
+        git_awareness.detached_head_strictness
+    } else {
+        git_awareness.strictness_for_branch(branch_name.as_deref())
+    };
 
     // Determine if the decision should be affected
     let mut affected_decision = false;
@@ -4316,6 +4443,15 @@ mod tests {
             run_git(repo_path, &["checkout", "-b", branch]);
         }
 
+        fn init_git_repo_detached(repo_path: &Path) {
+            init_git_repo(repo_path, "main");
+            // Need at least one commit to detach a HEAD that points anywhere.
+            std::fs::write(repo_path.join("seed"), "seed").expect("seed file");
+            run_git(repo_path, &["add", "seed"]);
+            run_git(repo_path, &["commit", "-m", "seed"]);
+            run_git(repo_path, &["checkout", "--detach", "HEAD"]);
+        }
+
         #[test]
         fn disabled_git_awareness_returns_unchanged_result() {
             let config = config_with_git_awareness(false);
@@ -4370,6 +4506,7 @@ mod tests {
                 relaxed_branches: vec![],
                 relaxed_strictness: StrictnessLevel::Critical,
                 default_strictness: StrictnessLevel::High,
+                detached_head_strictness: StrictnessLevel::All,
                 relaxed_disabled_packs: vec![],
                 show_branch_in_output: true,
                 warn_if_not_git: false,
@@ -4390,6 +4527,7 @@ mod tests {
                 relaxed_branches: vec!["feature/*".to_string(), "experiment/*".to_string()],
                 relaxed_strictness: StrictnessLevel::Critical,
                 default_strictness: StrictnessLevel::High,
+                detached_head_strictness: StrictnessLevel::All,
                 relaxed_disabled_packs: vec![],
                 show_branch_in_output: true,
                 warn_if_not_git: false,
@@ -4410,6 +4548,7 @@ mod tests {
                 relaxed_branches: vec!["feature/*".to_string()],
                 relaxed_strictness: StrictnessLevel::Critical,
                 default_strictness: StrictnessLevel::High,
+                detached_head_strictness: StrictnessLevel::All,
                 relaxed_disabled_packs: vec![],
                 show_branch_in_output: true,
                 warn_if_not_git: false,
@@ -4561,6 +4700,76 @@ mod tests {
             assert!(!branch_context.is_relaxed);
             assert_eq!(branch_context.strictness, StrictnessLevel::All);
             assert!(!branch_context.affected_decision);
+        }
+
+        #[test]
+        fn detached_head_uses_detached_head_strictness_not_default() {
+            // Detached HEAD typically signals rebase / bisect / checkout-tag.
+            // With detached_head_strictness=All and a Low-severity result,
+            // the result must stay Deny (the strictest knob applies),
+            // even though default_strictness=Critical would have allowed it.
+            let temp = tempfile::tempdir().expect("tempdir");
+            init_git_repo_detached(temp.path());
+
+            let mut config = Config::default();
+            config.git_awareness.enabled = true;
+            config.git_awareness.protected_branches = vec!["main".to_string()];
+            config.git_awareness.protected_strictness = StrictnessLevel::All;
+            config.git_awareness.relaxed_branches = vec!["feature/*".to_string()];
+            config.git_awareness.relaxed_strictness = StrictnessLevel::Critical;
+            // default_strictness is Critical (would NOT block Low) — proves
+            // detached_head_strictness overrides default, not the other way.
+            config.git_awareness.default_strictness = StrictnessLevel::Critical;
+            config.git_awareness.detached_head_strictness = StrictnessLevel::All;
+            config.git_awareness.warn_if_not_git = false;
+
+            let result = create_deny_result_with_severity(Severity::Low);
+            let modified = apply_branch_strictness(result, &config, Some(temp.path()));
+
+            // Decision stays Deny because detached_head_strictness=All blocks Low.
+            assert_eq!(modified.decision, EvaluationDecision::Deny);
+            let branch_context = modified
+                .branch_context
+                .expect("branch context should be populated");
+            assert!(branch_context.branch_name.is_none());
+            assert!(!branch_context.is_protected);
+            assert!(!branch_context.is_relaxed);
+            assert_eq!(branch_context.strictness, StrictnessLevel::All);
+        }
+
+        #[test]
+        fn detached_head_can_be_set_to_default_strictness() {
+            // Opt-out: setting detached_head_strictness equal to
+            // default_strictness restores the previous (loose) behavior.
+            let temp = tempfile::tempdir().expect("tempdir");
+            init_git_repo_detached(temp.path());
+
+            let mut config = Config::default();
+            config.git_awareness.enabled = true;
+            config.git_awareness.default_strictness = StrictnessLevel::Critical;
+            config.git_awareness.detached_head_strictness = StrictnessLevel::Critical;
+            config.git_awareness.warn_if_not_git = false;
+
+            let result = create_deny_result_with_severity(Severity::Low);
+            let modified = apply_branch_strictness(result, &config, Some(temp.path()));
+
+            // Critical strictness lets Low through.
+            assert_eq!(modified.decision, EvaluationDecision::Allow);
+            let branch_context = modified
+                .branch_context
+                .expect("branch context should be populated");
+            assert_eq!(branch_context.strictness, StrictnessLevel::Critical);
+            assert!(branch_context.affected_decision);
+        }
+
+        #[test]
+        fn detached_head_strictness_defaults_to_all() {
+            let cfg = Config::default();
+            assert_eq!(
+                cfg.git_awareness.detached_head_strictness,
+                StrictnessLevel::All,
+                "detached HEAD must default to the strictest level"
+            );
         }
     }
 
@@ -4986,6 +5195,146 @@ mod tests {
                 .decision_mode(),
                 "hard_block"
             );
+        }
+
+        // ====================================================================
+        // History-backed graduation (git_safety_guard-n9j1)
+        // ====================================================================
+
+        #[test]
+        fn standard_mode_history_count_at_soft_threshold_escalates_to_softblock() {
+            // session_count=1 alone in Standard would only Warn. With
+            // history_count >= history_soft_block (default 3), the response
+            // must escalate to SoftBlock.
+            let config = enabled_config();
+            let r = determine_graduated_response_with_history(
+                1,
+                Some(config.history_soft_block),
+                Severity::High,
+                &config,
+            )
+            .unwrap();
+            assert!(matches!(r, GraduatedResponse::SoftBlock { .. }));
+        }
+
+        #[test]
+        fn standard_mode_history_count_at_hard_threshold_escalates_to_hardblock() {
+            let config = enabled_config();
+            let r = determine_graduated_response_with_history(
+                1,
+                Some(config.history_hard_block),
+                Severity::High,
+                &config,
+            )
+            .unwrap();
+            assert!(matches!(r, GraduatedResponse::HardBlock { .. }));
+        }
+
+        #[test]
+        fn standard_mode_history_below_threshold_keeps_session_response() {
+            let config = enabled_config();
+            // history_count=1, below soft_block=3; session_count=1 → Warning.
+            let r = determine_graduated_response_with_history(1, Some(1), Severity::High, &config)
+                .unwrap();
+            assert!(matches!(r, GraduatedResponse::Warning { occurrence: 1 }));
+        }
+
+        #[test]
+        fn paranoid_mode_ignores_history_count() {
+            let mut config = enabled_config();
+            config.mode = GraduationMode::Paranoid;
+            // History should not change Paranoid's HardBlock behavior.
+            let r =
+                determine_graduated_response_with_history(1, Some(99), Severity::Medium, &config)
+                    .unwrap();
+            assert!(matches!(r, GraduatedResponse::HardBlock { .. }));
+        }
+
+        #[test]
+        fn lenient_mode_history_can_escalate_when_session_says_none() {
+            let mut config = enabled_config();
+            config.mode = GraduationMode::Lenient;
+            // session_count=1 in Lenient (doubled warn=2) → None.
+            // history_count >= soft_block escalates to SoftBlock.
+            let r = determine_graduated_response_with_history(
+                1,
+                Some(config.history_soft_block),
+                Severity::Medium,
+                &config,
+            )
+            .unwrap();
+            assert!(matches!(r, GraduatedResponse::SoftBlock { .. }));
+        }
+
+        #[test]
+        fn history_none_matches_legacy_signature() {
+            // The new entrypoint with history_count=None must agree exactly
+            // with the legacy session-only entrypoint.
+            let config = enabled_config();
+            for sc in [0, 1, 2, 5, 10] {
+                for sev in [
+                    Severity::Critical,
+                    Severity::High,
+                    Severity::Medium,
+                    Severity::Low,
+                ] {
+                    let legacy = determine_graduated_response(sc, sev, &config);
+                    let new_none =
+                        determine_graduated_response_with_history(sc, None, sev, &config);
+                    assert_eq!(legacy, new_none, "must match for sc={sc} sev={sev:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn parse_history_window_recognized_units() {
+            use crate::config::ResponseConfig;
+            assert_eq!(
+                ResponseConfig::parse_history_window("24h"),
+                Some(chrono::Duration::hours(24))
+            );
+            assert_eq!(
+                ResponseConfig::parse_history_window("7d"),
+                Some(chrono::Duration::days(7))
+            );
+            assert_eq!(
+                ResponseConfig::parse_history_window("30m"),
+                Some(chrono::Duration::minutes(30))
+            );
+            assert_eq!(
+                ResponseConfig::parse_history_window("90s"),
+                Some(chrono::Duration::seconds(90))
+            );
+            assert_eq!(ResponseConfig::parse_history_window(""), None);
+            assert_eq!(ResponseConfig::parse_history_window("24x"), None);
+        }
+
+        #[test]
+        fn parse_history_window_rejects_negative_and_overflow() {
+            use crate::config::ResponseConfig;
+            // Negative values would wrap (Utc::now() - (-window) = future cutoff).
+            assert_eq!(ResponseConfig::parse_history_window("-1h"), None);
+            assert_eq!(ResponseConfig::parse_history_window("-100d"), None);
+            // Values beyond the 100-year sane cap are rejected so we never
+            // hit chrono's panic-on-overflow path.
+            assert_eq!(ResponseConfig::parse_history_window("99999999999d"), None);
+            assert_eq!(
+                ResponseConfig::parse_history_window("9999999999999999999s"),
+                None
+            );
+            // Right at the cap is accepted.
+            assert_eq!(
+                ResponseConfig::parse_history_window("36500d"),
+                Some(chrono::Duration::days(36500))
+            );
+        }
+
+        #[test]
+        fn parse_history_window_handles_multibyte_trailing_char() {
+            use crate::config::ResponseConfig;
+            // Regression: previous `split_at(len-1)` would panic on a
+            // multi-byte trailing char. Char iteration is safe.
+            assert_eq!(ResponseConfig::parse_history_window("24é"), None);
         }
     }
 }

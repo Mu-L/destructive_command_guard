@@ -30,16 +30,39 @@
 )]
 
 use destructive_command_guard as dcg;
+use std::cell::Cell;
 use std::hint::black_box;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 static MEMORY_TEST_LOCK: Mutex<()> = Mutex::new(());
 const WARMUP_ITERATIONS: usize = 100;
 
-fn memory_test_guard() -> MutexGuard<'static, ()> {
-    MEMORY_TEST_LOCK
+thread_local! {
+    static MEMORY_TEST_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+struct MemoryTestLockGuard {
+    guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl Drop for MemoryTestLockGuard {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            MEMORY_TEST_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
+}
+
+fn memory_test_guard() -> MemoryTestLockGuard {
+    if MEMORY_TEST_LOCK_HELD.with(Cell::get) {
+        return MemoryTestLockGuard { guard: None };
+    }
+
+    let guard = MEMORY_TEST_LOCK
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner);
+    MEMORY_TEST_LOCK_HELD.with(|held| held.set(true));
+    MemoryTestLockGuard { guard: Some(guard) }
 }
 
 /// Check if we're running under coverage instrumentation.
@@ -256,6 +279,7 @@ fn memory_tracking_sanity_check() {
 
 #[test]
 fn memory_hook_input_parsing() {
+    let _guard = memory_test_guard();
     let commands = [
         "git status",
         "rm -rf /tmp/test",
@@ -275,6 +299,7 @@ fn memory_hook_input_parsing() {
 
 #[test]
 fn memory_pattern_evaluation() {
+    let _guard = memory_test_guard();
     let config = dcg::Config::load();
     let compiled_overrides = config.overrides.compile();
     let enabled_packs = config.enabled_pack_ids();
@@ -304,6 +329,7 @@ fn memory_pattern_evaluation() {
 
 #[test]
 fn memory_heredoc_extraction() {
+    let _guard = memory_test_guard();
     let heredocs = [
         sample_heredoc("echo hello"),
         sample_heredoc("rm -rf /tmp/test && ls"),
@@ -322,6 +348,7 @@ fn memory_heredoc_extraction() {
 
 #[test]
 fn memory_extractors() {
+    let _guard = memory_test_guard();
     const KEYWORDS: [&str; 1] = ["rm"];
 
     let pkg_json = r#"{"scripts":{"build":"rm -rf dist && webpack","test":"jest"}}"#;
@@ -358,6 +385,7 @@ build:
 
 #[test]
 fn memory_full_pipeline() {
+    let _guard = memory_test_guard();
     let mut config = dcg::Config::load();
     // Limit to core packs for memory leak budgets; avoids extra pack baselines.
     config.packs.enabled.clear();
@@ -420,6 +448,7 @@ fn sample_claude_input(cmd: &str) -> String {
 
 #[test]
 fn memory_codex_protocol_detection() {
+    let _guard = memory_test_guard();
     let codex_inputs: Vec<String> = [
         "git reset --hard HEAD~3",
         "rm -rf /",
@@ -455,6 +484,7 @@ fn memory_codex_protocol_detection() {
 
 #[test]
 fn memory_codex_deny_pipeline() {
+    let _guard = memory_test_guard();
     let mut config = dcg::Config::load();
     config.packs.enabled.clear();
     let compiled_overrides = config.overrides.compile();
@@ -518,6 +548,7 @@ fn memory_codex_deny_pipeline() {
 
 #[test]
 fn memory_codex_deny_output_formatting() {
+    let _guard = memory_test_guard();
     let allow_once = dcg::hook::AllowOnceInfo {
         code: "abc12".to_string(),
         full_hash: "deadbeef1234567890".to_string(),
@@ -564,6 +595,7 @@ fn memory_codex_deny_output_formatting() {
 
 #[test]
 fn memory_codex_vs_claude_deny_parity() {
+    let _guard = memory_test_guard();
     let mut config = dcg::Config::load();
     config.packs.enabled.clear();
     let compiled_overrides = config.overrides.compile();
@@ -727,6 +759,7 @@ fn run_codex_deny_subprocess(dcg_bin: &std::path::Path, codex_payload: &str) {
 
 #[test]
 fn memory_leak_self_test() {
+    let _guard = memory_test_guard();
     if get_memory_usage().is_none() {
         println!("memory_leak_self_test: SKIPPED (memory tracking not available)");
         return;

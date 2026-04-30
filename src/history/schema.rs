@@ -118,21 +118,90 @@ fn opt_i64_to_sv(v: Option<&i64>) -> SqliteValue {
 /// Workaround: fsqlite's `query_with_params()` only returns the first matching
 /// row instead of all rows. This helper substitutes `?1`, `?2`, ... placeholders
 /// with the actual values so we can use the non-parameterized `query()` method.
+///
+/// **Correctness note (`git_safety_guard-tovy`):** the previous reverse-`replace`
+/// implementation was vulnerable to substituted-value-collides-with-earlier-
+/// placeholder corruption. If `params[4]` was the literal text `?1`, replacing
+/// `?5` first would inject `'?1'` into the SQL — and the subsequent pass over
+/// `?1` would then re-substitute that injected text. This implementation walks
+/// the SQL template left-to-right, recognizing `?N` only inside the template
+/// itself (not inside single-quoted string literals), and writes substituted
+/// values into the output without ever rescanning them. Single-pass, no
+/// recursion possible.
 fn inline_params(sql: &str, params: &[SqliteValue]) -> String {
-    let mut result = sql.to_string();
-    // Replace in reverse order so ?10 is replaced before ?1
-    for (i, param) in params.iter().enumerate().rev() {
-        let placeholder = format!("?{}", i + 1);
-        let value = match param {
-            SqliteValue::Text(s) => format!("'{}'", s.replace('\'', "''")),
-            SqliteValue::Integer(i) => i.to_string(),
-            SqliteValue::Float(f) => f.to_string(),
-            SqliteValue::Null => "NULL".to_string(),
-            SqliteValue::Blob(_) => "X''".to_string(),
-        };
-        result = result.replace(&placeholder, &value);
+    // Walk by `char` rather than `u8` so a multi-byte UTF-8 character in
+    // the SQL template (e.g. an em-dash inside a string literal, a
+    // non-ASCII column comment) doesn't get split mid-codepoint and
+    // emitted as garbage Latin-1. None of today's callers use non-ASCII
+    // templates, but keeping this byte-safe avoids a foot-gun for future
+    // additions. SQL templates are small (<1 KB) so the `Vec<char>`
+    // allocation is negligible.
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            // Inside a single-quoted string literal. SQLite escapes a quote
+            // by doubling it (`''`), so a `'` followed by `'` stays inside
+            // the string and consumes both characters.
+            out.push(c);
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '\'' {
+            in_string = true;
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+
+        if c == '?' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            // Parse the full digit run that follows `?`.
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let idx_str: String = chars[i + 1..j].iter().collect();
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                if idx >= 1 && idx <= params.len() {
+                    let value = match &params[idx - 1] {
+                        SqliteValue::Text(s) => format!("'{}'", s.replace('\'', "''")),
+                        SqliteValue::Integer(n) => n.to_string(),
+                        SqliteValue::Float(f) => f.to_string(),
+                        SqliteValue::Null => "NULL".to_string(),
+                        SqliteValue::Blob(_) => "X''".to_string(),
+                    };
+                    out.push_str(&value);
+                    i = j;
+                    continue;
+                }
+            }
+            // Unknown placeholder index — preserve the original text so the
+            // SQL parser surfaces the error at execution time rather than
+            // silently producing wrong results.
+            out.push('?');
+            out.push_str(&idx_str);
+            i = j;
+            continue;
+        }
+
+        out.push(c);
+        i += 1;
     }
-    result
+
+    out
 }
 
 /// Current schema version for migrations.
@@ -961,6 +1030,31 @@ impl HistoryDb {
                AND outcome = 'deny'
                AND timestamp >= ?2",
             &[text_sv(pattern_id.to_string()), text_sv(cutoff_ts)],
+        )?;
+        Ok(count_to_u32(sv_to_i64(&row.values()[0])))
+    }
+
+    /// Count occurrences of a specific command (by `command_hash`) blocked
+    /// within the given lookback window. Used by the graduated-response
+    /// system to escalate Standard/Lenient mode based on cross-process
+    /// repetition that the in-process session counter cannot observe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying SQL query fails.
+    pub fn count_command_blocks_in_window(
+        &self,
+        command: &str,
+        window: Duration,
+    ) -> Result<u32, HistoryError> {
+        let hash = command_hash_for(command);
+        let cutoff_ts = format_timestamp(Utc::now() - window);
+        let row = self.conn.query_row_with_params(
+            "SELECT COUNT(*) FROM commands
+             WHERE command_hash = ?1
+               AND outcome = 'deny'
+               AND timestamp >= ?2",
+            &[text_sv(hash), text_sv(cutoff_ts)],
         )?;
         Ok(count_to_u32(sv_to_i64(&row.values()[0])))
     }
@@ -6341,5 +6435,105 @@ mod tests {
         // Verify trending fields exist
         assert!(m.change_percentage.is_finite());
         assert_eq!(m.previous_period_hits, 0);
+    }
+
+    // ========================================================================
+    // inline_params correctness tests (git_safety_guard-tovy)
+    // ========================================================================
+
+    #[test]
+    fn inline_params_substitutes_in_template_order() {
+        let sql = "SELECT * FROM t WHERE a = ?1 AND b = ?2 AND c = ?3";
+        let params = vec![
+            SqliteValue::Integer(10),
+            SqliteValue::Text("hi".into()),
+            SqliteValue::Null,
+        ];
+        let out = inline_params(sql, &params);
+        assert_eq!(
+            out,
+            "SELECT * FROM t WHERE a = 10 AND b = 'hi' AND c = NULL"
+        );
+    }
+
+    #[test]
+    fn inline_params_substituted_value_is_not_rescanned() {
+        // The bug: a value containing literal `?1` text used to be re-scanned
+        // and re-substituted on the next pass. Fixed implementation must
+        // emit the value verbatim (with escaping) and never look at it again.
+        let sql = "SELECT * FROM t WHERE a = ?1 AND b = ?2";
+        let params = vec![
+            SqliteValue::Text("real-a".into()),
+            SqliteValue::Text("?1".into()), // <-- the trap
+        ];
+        let out = inline_params(sql, &params);
+        assert_eq!(out, "SELECT * FROM t WHERE a = 'real-a' AND b = '?1'");
+    }
+
+    #[test]
+    fn inline_params_preserves_placeholder_inside_string_literal() {
+        // A literal `?1` already inside a single-quoted string in the SQL
+        // template must NOT be substituted — it's part of a string constant,
+        // not a parameter marker. fsqlite would never bind it; neither
+        // should our inliner.
+        let sql = "SELECT '?1' AS lit, x FROM t WHERE x = ?1";
+        let params = vec![SqliteValue::Integer(7)];
+        let out = inline_params(sql, &params);
+        assert_eq!(out, "SELECT '?1' AS lit, x FROM t WHERE x = 7");
+    }
+
+    #[test]
+    fn inline_params_handles_doubled_single_quote_escape_inside_string() {
+        // SQLite escapes single quotes inside a string by doubling: 'it''s'
+        // is "it's". The walk must stay in `in_string` state across the
+        // doubled quote and not exit until the real terminator.
+        let sql = "SELECT 'it''s ?1' AS lit, x FROM t WHERE x = ?1";
+        let params = vec![SqliteValue::Integer(99)];
+        let out = inline_params(sql, &params);
+        assert_eq!(out, "SELECT 'it''s ?1' AS lit, x FROM t WHERE x = 99");
+    }
+
+    #[test]
+    fn inline_params_two_digit_indexes_resolve_before_one_digit_prefix() {
+        // ?10 must be parsed as a full digit run, not as ?1 followed by 0.
+        let sql = "SELECT ?1, ?10";
+        let params = (1..=10)
+            .map(|n| SqliteValue::Integer(i64::from(n)))
+            .collect::<Vec<_>>();
+        let out = inline_params(sql, &params);
+        assert_eq!(out, "SELECT 1, 10");
+    }
+
+    #[test]
+    fn inline_params_escapes_single_quotes_in_string_values() {
+        let sql = "SELECT * FROM t WHERE c = ?1";
+        let params = vec![SqliteValue::Text("o'reilly".into())];
+        let out = inline_params(sql, &params);
+        assert_eq!(out, "SELECT * FROM t WHERE c = 'o''reilly'");
+    }
+
+    #[test]
+    fn inline_params_unknown_index_passes_through() {
+        // Out-of-range placeholder is left as-is so the SQL parser
+        // surfaces the error rather than silently producing wrong results.
+        let sql = "SELECT ?5";
+        let params = vec![SqliteValue::Integer(1)];
+        let out = inline_params(sql, &params);
+        assert_eq!(out, "SELECT ?5");
+    }
+
+    #[test]
+    fn inline_params_preserves_utf8_in_template() {
+        // A future caller might embed non-ASCII in a string literal or comment
+        // inside the SQL template (em-dash, accented char, emoji). The walker
+        // must traverse by `char`, not by byte, so multi-byte sequences
+        // round-trip intact.
+        let sql = "SELECT 'naïve façade — done' AS lit, x FROM t WHERE x = ?1";
+        let params = vec![SqliteValue::Integer(7)];
+        let out = inline_params(sql, &params);
+        assert_eq!(
+            out,
+            "SELECT 'naïve façade — done' AS lit, x FROM t WHERE x = 7"
+        );
     }
 }

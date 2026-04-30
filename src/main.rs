@@ -108,14 +108,68 @@ fn build_history_entry(
     }
 }
 
+/// Process-wide registry of shutdown actions.
+///
+/// `std::process::exit` skips Drop, so any subsystem with cross-call buffered
+/// state (history writer, future stores) needs an explicit pre-exit flush.
+/// Each subsystem registers a closure here at startup; the SIGINT handler
+/// invokes them in order before exiting. New stores should add a registration
+/// call — do not add ad-hoc flush logic to the SIGINT handler itself.
+type ShutdownAction = Box<dyn Fn() + Send + Sync>;
+
+static SHUTDOWN_ACTIONS: std::sync::OnceLock<std::sync::Mutex<Vec<ShutdownAction>>> =
+    std::sync::OnceLock::new();
+
+fn shutdown_registry() -> &'static std::sync::Mutex<Vec<ShutdownAction>> {
+    SHUTDOWN_ACTIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn register_shutdown_action<F>(action: F)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    let actions = shutdown_registry();
+    if let Ok(mut guard) = actions.lock() {
+        guard.push(Box::new(action));
+    }
+}
+
+fn run_shutdown_actions() {
+    let actions = shutdown_registry();
+    // Recover from a poisoned lock: a previous panic mid-action shouldn't
+    // prevent subsequent shutdown calls from flushing remaining stores.
+    let guard = match actions.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    for action in guard.iter() {
+        // Catch panics so one buggy flush doesn't skip the rest. We can't
+        // do anything useful with the panic payload at shutdown — at best,
+        // log it; failing that, swallow it. The other registered stores
+        // still need their chance to flush.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action));
+    }
+}
+
+fn install_signal_shutdown_handler() {
+    // Idempotent: ctrlc::set_handler returns Err on duplicate install. The
+    // handler itself runs every action in the registry deterministically
+    // (in registration order), then exits 130. Code 130 is the canonical
+    // "interrupted by SIGINT" status (128 + SIGINT(2)).
+    let _ = ctrlc::set_handler(|| {
+        eprintln!("[dcg] Flushing on signal...");
+        run_shutdown_actions();
+        std::process::exit(130);
+    });
+}
+
 fn install_history_shutdown_handler(
     handle: destructive_command_guard::history::HistoryFlushHandle,
 ) {
-    let _ = ctrlc::set_handler(move || {
-        eprintln!("[dcg] Flushing history...");
+    register_shutdown_action(move || {
         handle.flush_sync();
-        std::process::exit(130);
     });
+    install_signal_shutdown_handler();
 }
 
 fn remove_disabled_packs_for_agent(
@@ -1518,6 +1572,66 @@ mod tests {
             assert!(DEFAULT_MAX_COMMAND_BYTES <= 256 * 1024); // At most 256KB
             assert!(DEFAULT_MAX_FINDINGS_PER_COMMAND >= 10); // At least 10
             assert!(DEFAULT_MAX_FINDINGS_PER_COMMAND <= 1000); // At most 1000
+        }
+    }
+
+    mod shutdown_registry_tests {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[test]
+        fn registered_actions_all_run_on_shutdown_invocation() {
+            // Each registered closure increments a shared counter. We verify
+            // BOTH ran (after - before >= 2) without depending on ordering
+            // between this test and other tests that may have registered
+            // actions in the same process — the registry is process-wide.
+            let counter = Arc::new(AtomicUsize::new(0));
+
+            let c1 = Arc::clone(&counter);
+            register_shutdown_action(move || {
+                c1.fetch_add(1, Ordering::SeqCst);
+            });
+            let c2 = Arc::clone(&counter);
+            register_shutdown_action(move || {
+                c2.fetch_add(1, Ordering::SeqCst);
+            });
+
+            let before = counter.load(Ordering::SeqCst);
+            run_shutdown_actions();
+            let after = counter.load(Ordering::SeqCst);
+
+            assert!(
+                after - before >= 2,
+                "both registered actions must run; before={before} after={after}"
+            );
+        }
+
+        #[test]
+        fn run_shutdown_actions_continues_after_panicking_action() {
+            // git_safety_guard-i5gd defense: a buggy or panicking flush
+            // closure must not skip subsequent registered actions. We
+            // register a panicker and a counter-incrementer; after the
+            // panic-catching shutdown invocation the counter must have
+            // advanced, proving the second action ran.
+            let counter = Arc::new(AtomicUsize::new(0));
+
+            register_shutdown_action(|| {
+                panic!("simulated flush failure");
+            });
+            let c = Arc::clone(&counter);
+            register_shutdown_action(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+
+            let before = counter.load(Ordering::SeqCst);
+            run_shutdown_actions();
+            let after = counter.load(Ordering::SeqCst);
+
+            assert!(
+                after > before,
+                "panicking action must not block subsequent ones; before={before} after={after}"
+            );
         }
     }
 }
