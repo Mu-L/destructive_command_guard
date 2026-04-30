@@ -6065,6 +6065,12 @@ fn print_scan_pretty_plain(report: &crate::scan::ScanReport, verbose: bool, top:
         "Files: {considered} considered, {} scanned, {} skipped",
         report.summary.files_scanned, report.summary.files_skipped
     );
+    if !report.summary.paths_skipped.is_empty() {
+        println!("{}", "Skipped input path(s):".yellow());
+        for entry in &report.summary.paths_skipped {
+            println!("  {} ({:?})", entry.path, entry.reason);
+        }
+    }
     println!("Commands extracted: {}", report.summary.commands_extracted);
     println!(
         "Findings: {} (allow={}, warn={}, deny={})",
@@ -6172,6 +6178,12 @@ fn print_scan_pretty_rich(report: &crate::scan::ScanReport, verbose: bool, top: 
         "[cyan]Files:[/] {considered} considered, {} scanned, {} skipped",
         report.summary.files_scanned, report.summary.files_skipped
     ));
+    if !report.summary.paths_skipped.is_empty() {
+        con.print("[yellow]Skipped input path(s):[/]");
+        for entry in &report.summary.paths_skipped {
+            con.print(&format!("  {} ({:?})", entry.path, entry.reason));
+        }
+    }
     con.print(&format!(
         "[cyan]Commands extracted:[/] {}",
         report.summary.commands_extracted
@@ -6343,6 +6355,10 @@ fn print_scan_markdown_summary(report: &crate::scan::ScanReport) {
     println!("| Files scanned | {} |", report.summary.files_scanned);
     println!("| Files skipped | {} |", report.summary.files_skipped);
     println!(
+        "| Input paths skipped | {} |",
+        report.summary.paths_skipped.len()
+    );
+    println!(
         "| Commands extracted | {} |",
         report.summary.commands_extracted
     );
@@ -6354,6 +6370,13 @@ fn print_scan_markdown_summary(report: &crate::scan::ScanReport) {
 
     if report.summary.max_findings_reached {
         println!("\n:warning: *Max findings limit reached, scan stopped early.*");
+    }
+
+    if !report.summary.paths_skipped.is_empty() {
+        println!("\n### Skipped Input Paths\n");
+        for entry in &report.summary.paths_skipped {
+            println!("- `{}` ({:?})", entry.path, entry.reason);
+        }
     }
 }
 

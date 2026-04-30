@@ -400,6 +400,10 @@ impl ScanEvalContext {
 
 #[must_use]
 pub fn should_fail(report: &ScanReport, fail_on: ScanFailOn) -> bool {
+    if !report.summary.paths_skipped.is_empty() && fail_on.blocks(ScanSeverity::Error) {
+        return true;
+    }
+
     report.findings.iter().any(|f| fail_on.blocks(f.severity))
 }
 
@@ -4403,6 +4407,19 @@ resource "null_resource" "test" {
 
         assert!(!should_fail(&report, ScanFailOn::Error));
         assert!(!should_fail(&report, ScanFailOn::Warning));
+        assert!(!should_fail(&report, ScanFailOn::None));
+    }
+
+    #[test]
+    fn should_fail_when_top_level_paths_are_skipped() {
+        let mut report = build_report(vec![], 0, 0, 0, false, None);
+        report.summary.paths_skipped.push(SkippedEntry {
+            path: "missing/path".to_string(),
+            reason: SkipReason::PathNotFound,
+        });
+
+        assert!(should_fail(&report, ScanFailOn::Error));
+        assert!(should_fail(&report, ScanFailOn::Warning));
         assert!(!should_fail(&report, ScanFailOn::None));
     }
 
