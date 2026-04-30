@@ -2075,6 +2075,28 @@ fn evaluate_packs_with_allowlists(
 
             return EvaluationResult::denied_by_pack(pack_id, reason, pattern.explanation);
         }
+
+        if should_check_original_control_plane_payload(
+            pack_id.as_str(),
+            command_for_packs,
+            original_command,
+        ) {
+            if let Some(result) = evaluate_pack_destructive_patterns(
+                pack_id,
+                pack,
+                original_command,
+                0,
+                original_command,
+                Some(0),
+                original_len,
+                allowlists,
+                project_path,
+                &mut first_allowlist_hit,
+                deadline,
+            ) {
+                return result;
+            }
+        }
     }
 
     if let Some((matched, layer, reason)) = first_allowlist_hit {
@@ -2098,6 +2120,18 @@ fn span_is_inside_any_segment(span: MatchSpan, segment_ranges: &[(usize, usize)]
     segment_ranges
         .iter()
         .any(|&(start, end)| span.start >= start && span.end <= end)
+}
+
+fn should_check_original_control_plane_payload(
+    pack_id: &str,
+    command_for_packs: &str,
+    original_command: &str,
+) -> bool {
+    // `curl -d/--data*` payloads are normally masked as inert data to avoid
+    // generic false positives. Railway's API protections intentionally inspect
+    // GraphQL mutation payloads, so re-check only that control-plane pack on the
+    // original command after the sanitized pass misses.
+    command_for_packs != original_command && matches!(pack_id, "platform.railway")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3259,6 +3293,27 @@ mod tests {
         assert!(
             result.is_allowed(),
             "read-only Railway segments should pass"
+        );
+    }
+
+    #[test]
+    fn railway_api_mutations_in_curl_payloads_are_not_hidden_by_data_masking() {
+        let result = evaluate_with_pack_ids(
+            r#"curl https://backboard.railway.app/graphql/v2 --data-binary '{"query":"mutation($in: VariableUpsertInput!){variableUpsert(input:$in)}","variables":{"in":{"name":"DATABASE_PUBLIC_URL","value":"postgres://prod"}}}'"#,
+            &["platform.railway"],
+        );
+
+        assert!(
+            result.is_denied(),
+            "Railway API variableUpsert payload must be blocked"
+        );
+        let info = result
+            .pattern_info
+            .expect("denial should include pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("railway-api-database-variable-upsert")
         );
     }
 

@@ -1090,6 +1090,7 @@ static PACK_ENTRIES: [PackEntry; 84] = [
             "volumeInstanceDelete",
             "volumeInstanceUpdate",
             "variableDelete",
+            "variableUpsert",
             "variableCollectionUpsert",
             "deploymentRemove",
             "deploymentStop",
