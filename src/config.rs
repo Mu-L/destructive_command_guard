@@ -14,8 +14,130 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+/// Maximum config file size dcg is willing to read into memory.
+///
+/// `fs::read_to_string` is unbounded; a malicious or accidentally-huge file
+/// (a 2 GiB symlinked log, a runaway dump) would otherwise be loaded in
+/// full before parsing. 1 MiB is well above any sane TOML config; loaded
+/// data above this cap is rejected.
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Trust class for a config-file source. Controls symlink handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigSource {
+    /// User/project layer (or any caller-controlled path). Symlinks are
+    /// followed normally; the only enforcement is the size cap.
+    Untrusted,
+    /// System-wide config layer (`/etc/dcg/config.toml`). Refuses to load
+    /// when the path is a symlink to a target the current user can write
+    /// to — that combination would let a non-root user influence the
+    /// privileged config layer by planting a symlink.
+    System,
+}
+
+/// Read a config file with a size cap and (for system layer) a symlink
+/// safety check. Returns `None` and logs a warning on any failure.
+pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Option<String> {
+    if source == ConfigSource::System {
+        // Symlink defense: refuse to follow if the link target is in a
+        // user-writable location. We use `symlink_metadata` so the call
+        // does not traverse the link itself.
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if symlink_target_is_user_writable(path) {
+                    eprintln!(
+                        "Warning: refusing to load system config '{}' — symlink to user-writable target",
+                        path.display()
+                    );
+                    return None;
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to stat config file '{}': {}",
+                    path.display(),
+                    e
+                );
+                return None;
+            }
+        }
+    }
+
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!(
+                "Warning: Failed to read config file '{}': {}",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
+
+    // `take(MAX_CONFIG_BYTES + 1)` lets us tell "exactly cap" (allowed) from
+    // "more than cap" (rejected) without reading unbounded bytes either way.
+    let mut buf = String::new();
+    if let Err(e) = file
+        .by_ref()
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut buf)
+    {
+        eprintln!(
+            "Warning: Failed to read config file '{}': {}",
+            path.display(),
+            e
+        );
+        return None;
+    }
+    if buf.len() as u64 > MAX_CONFIG_BYTES {
+        eprintln!(
+            "Warning: refusing to load config '{}' — exceeds {}-byte cap",
+            path.display(),
+            MAX_CONFIG_BYTES
+        );
+        return None;
+    }
+
+    Some(buf)
+}
+
+fn symlink_target_is_user_writable(path: &Path) -> bool {
+    // Resolve the link target and check if its parent directory is owned
+    // by a non-root user / writable by non-root. The conservative answer
+    // ("yes, user-writable") on any error keeps the safety check biased
+    // toward refusing to load.
+    let Ok(target) = fs::canonicalize(path) else {
+        return true;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = target.parent().unwrap_or(&target);
+        let Ok(meta) = fs::metadata(parent) else {
+            return true;
+        };
+        // Anything not owned by root (uid 0) is treated as user-writable.
+        // This is conservative: a target owned by root in a non-root-only
+        // directory is still safer to refuse than load.
+        meta.uid() != 0
+    }
+    #[cfg(not(unix))]
+    {
+        // No portable way to express "user-writable" cross-platform.
+        // On non-unix the symlink-into-system-config attack does not
+        // apply the same way; default to allowing the load.
+        let _ = target;
+        false
+    }
+}
 
 /// Environment variable prefix for all config options.
 const ENV_PREFIX: &str = "DCG";
@@ -216,6 +338,7 @@ struct GitAwarenessConfigLayer {
     relaxed_branches: Option<Vec<String>>,
     relaxed_strictness: Option<StrictnessLevel>,
     default_strictness: Option<StrictnessLevel>,
+    detached_head_strictness: Option<StrictnessLevel>,
     relaxed_disabled_packs: Option<Vec<String>>,
     show_branch_in_output: Option<bool>,
     warn_if_not_git: Option<bool>,
@@ -552,10 +675,12 @@ impl SeverityOverrides {
 /// callers like `dcg test`, the MCP server, or repeated CLI evaluations.
 ///
 /// `history_soft_block` / `history_hard_block` / `history_window` are the
-/// cross-process thresholds backed by the history database. They are parsed
-/// and merged across config layers but are **not yet consulted** by
-/// [`crate::evaluator::determine_graduated_response`] — see the docstring
-/// there for the current scope and intended future wiring.
+/// cross-process thresholds backed by the history database. Standard/Lenient
+/// graduation modes consult them via
+/// [`crate::evaluator::determine_graduated_response_with_history`] /
+/// [`crate::evaluator::EvaluationResult::apply_graduation_with_history_db`].
+/// Paranoid / Strict / WarningOnly / Disabled modes are unaffected — they
+/// don't have escalation tiers driven by occurrence count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseConfig {
     #[serde(default)]
@@ -597,6 +722,51 @@ impl ResponseConfig {
     }
     fn default_history_window() -> String {
         "24h".to_string()
+    }
+
+    /// Parse `history_window` (e.g. `"24h"`, `"7d"`, `"30m"`) into a
+    /// `chrono::Duration`. Returns `None` for an unrecognized format,
+    /// negative values, or values that would overflow.
+    /// Suffix grammar: `s` (seconds), `m` (minutes), `h` (hours),
+    /// `d` (days). Numeric prefix only — no compound expressions.
+    #[must_use]
+    pub fn parse_history_window(window: &str) -> Option<chrono::Duration> {
+        // Sane upper bound: 100 years in any unit. Chrono's `Duration::days`
+        // family panics on i64-overflow when converting to internal seconds;
+        // 100y in seconds is ~3.15e9, comfortably below i64::MAX.
+        // Negative durations don't make sense for a "lookback window" — the
+        // caller would wrap them as `Utc::now() - (-window) = Utc::now() + window`
+        // (a future cutoff) and silently see zero matches.
+        const MAX_DAYS: i64 = 365 * 100;
+        const MAX_HOURS: i64 = MAX_DAYS * 24;
+        const MAX_MINUTES: i64 = MAX_HOURS * 60;
+        const MAX_SECONDS: i64 = MAX_MINUTES * 60;
+
+        let trimmed = window.trim();
+        // Use char iteration rather than `split_at(len-1)` so a multi-byte
+        // trailing char (e.g. `"24é"`) doesn't panic on a non-char-boundary
+        // byte index.
+        let unit = trimmed.chars().last()?;
+        let num_part: String = trimmed.chars().take(trimmed.chars().count() - 1).collect();
+        let n: i64 = num_part.parse().ok()?;
+        if n < 0 {
+            return None;
+        }
+        match unit {
+            's' if n <= MAX_SECONDS => Some(chrono::Duration::seconds(n)),
+            'm' if n <= MAX_MINUTES => Some(chrono::Duration::minutes(n)),
+            'h' if n <= MAX_HOURS => Some(chrono::Duration::hours(n)),
+            'd' if n <= MAX_DAYS => Some(chrono::Duration::days(n)),
+            _ => None,
+        }
+    }
+
+    /// Parse this config's history_window using `parse_history_window`,
+    /// falling back to 24h if the string is malformed.
+    #[must_use]
+    pub fn history_window_duration(&self) -> chrono::Duration {
+        Self::parse_history_window(&self.history_window)
+            .unwrap_or_else(|| chrono::Duration::hours(24))
     }
 
     /// Effective graduation mode for a severity.
@@ -1160,6 +1330,10 @@ impl PacksConfig {
     }
 
     /// `expand_custom_paths` with an explicit cwd, for testability.
+    // `${repo_root}` is a deliberate shell-style placeholder we expand
+    // ourselves; clippy's literal_string_with_formatting_args lint mistakes it
+    // for an unused std::fmt placeholder.
+    #[allow(clippy::literal_string_with_formatting_args)]
     #[must_use]
     pub fn expand_custom_paths_from(&self, cwd: Option<&Path>) -> Vec<String> {
         let mut result = Vec::new();
@@ -1185,7 +1359,9 @@ impl PacksConfig {
                     if after_repo_root == "~" {
                         home.to_string_lossy().into_owned()
                     } else {
-                        home.join(&after_repo_root[2..]).to_string_lossy().into_owned()
+                        home.join(&after_repo_root[2..])
+                            .to_string_lossy()
+                            .into_owned()
                     }
                 } else {
                     after_repo_root
@@ -2100,6 +2276,16 @@ pub struct GitAwarenessConfig {
     /// Default: `High` (normal behavior)
     pub default_strictness: StrictnessLevel,
 
+    /// Strictness level when HEAD is detached (no branch checked out).
+    ///
+    /// Detached HEAD typically signals a rebase, bisect, or checkout-of-tag
+    /// operation — exactly the contexts where uncommitted work is most easily
+    /// lost. Defaults to `All` (strictest), matching the protected-branch
+    /// posture rather than the per-branch default. Set this to
+    /// `default_strictness` if you want detached HEAD treated like an
+    /// unprotected branch.
+    pub detached_head_strictness: StrictnessLevel,
+
     /// Packs to disable on relaxed branches.
     /// These packs will be skipped during evaluation when on a relaxed branch.
     /// Default: empty (no packs disabled)
@@ -2135,6 +2321,7 @@ impl Default for GitAwarenessConfig {
             ],
             relaxed_strictness: StrictnessLevel::Critical,
             default_strictness: StrictnessLevel::High,
+            detached_head_strictness: StrictnessLevel::All,
             relaxed_disabled_packs: Vec::new(),
             show_branch_in_output: true,
             warn_if_not_git: false,
@@ -2824,18 +3011,7 @@ impl Config {
     /// configs can explicitly set values back to defaults.
     #[must_use]
     fn load_layer_from_file(path: &Path) -> Option<ConfigLayer> {
-        let content = match fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to read config file '{}': {}",
-                    path.display(),
-                    e
-                );
-                return None;
-            }
-        };
+        let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
 
         match toml::from_str(&content) {
             Ok(layer) => Some(layer),
@@ -2858,9 +3034,26 @@ impl Config {
     }
 
     /// Load system-wide configuration.
+    ///
+    /// The `/etc/dcg/config.toml` path is treated as a privileged config
+    /// source: it sits in `ConfigSource::System`, which means
+    /// `read_config_file_bounded` refuses to follow symlinks pointing at
+    /// user-writable targets (a non-root user could otherwise influence
+    /// system-layer config by symlinking it into their home directory).
     fn load_system_config_layer() -> Option<ConfigLayer> {
         let path = PathBuf::from("/etc/dcg").join(CONFIG_FILE_NAME);
-        Self::load_layer_from_file(&path)
+        let content = read_config_file_bounded(&path, ConfigSource::System)?;
+        match toml::from_str(&content) {
+            Ok(layer) => Some(layer),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to parse system config file '{}': {}",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// Load user configuration.
@@ -3206,6 +3399,9 @@ impl Config {
         if let Some(default_strictness) = git_awareness.default_strictness {
             self.git_awareness.default_strictness = default_strictness;
         }
+        if let Some(detached_head_strictness) = git_awareness.detached_head_strictness {
+            self.git_awareness.detached_head_strictness = detached_head_strictness;
+        }
         if let Some(relaxed_disabled_packs) = git_awareness.relaxed_disabled_packs {
             self.git_awareness.relaxed_disabled_packs = relaxed_disabled_packs;
         }
@@ -3516,6 +3712,13 @@ impl Config {
         if let Some(strictness) = get_env(&format!("{ENV_PREFIX}_GIT_DEFAULT_STRICTNESS")) {
             if let Some(parsed) = StrictnessLevel::from_str_case_insensitive(&strictness) {
                 self.git_awareness.default_strictness = parsed;
+            }
+        }
+
+        // DCG_GIT_DETACHED_HEAD_STRICTNESS=critical|high|medium|all
+        if let Some(strictness) = get_env(&format!("{ENV_PREFIX}_GIT_DETACHED_HEAD_STRICTNESS")) {
+            if let Some(parsed) = StrictnessLevel::from_str_case_insensitive(&strictness) {
+                self.git_awareness.detached_head_strictness = parsed;
             }
         }
 
@@ -5448,6 +5651,7 @@ enabled = false
             relaxed_branches: vec!["release/beta".to_string(), "feature/*".to_string()],
             relaxed_strictness: StrictnessLevel::Critical,
             default_strictness: StrictnessLevel::Medium,
+            detached_head_strictness: StrictnessLevel::All,
             relaxed_disabled_packs: vec!["containers.docker".to_string()],
             show_branch_in_output: true,
             warn_if_not_git: false,
@@ -5481,6 +5685,7 @@ enabled = false
             relaxed_branches: vec!["feature/*".to_string()],
             relaxed_strictness: StrictnessLevel::Critical,
             default_strictness: StrictnessLevel::High,
+            detached_head_strictness: StrictnessLevel::All,
             relaxed_disabled_packs: vec!["containers.docker".to_string(), "cloud.aws".to_string()],
             show_branch_in_output: true,
             warn_if_not_git: false,
@@ -7583,6 +7788,76 @@ low = "disabled"
         };
 
         let resolved = packs.expand_custom_paths_from(Some(&nonrepo));
-        assert!(resolved.is_empty(), "no repo root → token entry skipped, literal missing → empty");
+        assert!(
+            resolved.is_empty(),
+            "no repo root → token entry skipped, literal missing → empty"
+        );
+    }
+
+    // ========================================================================
+    // Bounded config file reads (git_safety_guard-tck0)
+    // ========================================================================
+
+    #[test]
+    fn read_config_file_bounded_returns_content_under_cap() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let payload = "key = \"value\"\n".to_string();
+        std::fs::write(&path, &payload).unwrap();
+
+        let read = read_config_file_bounded(&path, ConfigSource::Untrusted)
+            .expect("should read file under cap");
+        assert_eq!(read, payload);
+    }
+
+    #[test]
+    fn read_config_file_bounded_rejects_oversized_file() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        // Write MAX_CONFIG_BYTES + 64 bytes — comfortably above the cap.
+        let payload = "x".repeat(usize::try_from(MAX_CONFIG_BYTES).unwrap_or(usize::MAX) + 64);
+        std::fs::write(&path, &payload).unwrap();
+
+        let read = read_config_file_bounded(&path, ConfigSource::Untrusted);
+        assert!(
+            read.is_none(),
+            "files exceeding MAX_CONFIG_BYTES must be rejected"
+        );
+    }
+
+    #[test]
+    fn read_config_file_bounded_returns_none_for_missing_path() {
+        let path =
+            std::env::temp_dir().join(format!("dcg-config-missing-{}-{}", std::process::id(), 42));
+        let read = read_config_file_bounded(&path, ConfigSource::Untrusted);
+        assert!(read.is_none());
+        // Same for system source.
+        let read = read_config_file_bounded(&path, ConfigSource::System);
+        assert!(read.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_file_bounded_system_rejects_user_writable_symlink_target() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().expect("tempdir");
+        // Real (user-writable) target.
+        let target = temp.path().join("user_target.toml");
+        std::fs::write(&target, "key = \"injected\"").unwrap();
+        // Symlink at a location we'll claim is "system".
+        let symlink_path = temp.path().join("system_config.toml");
+        std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+
+        let read = read_config_file_bounded(&symlink_path, ConfigSource::System);
+        assert!(
+            read.is_none(),
+            "system layer must refuse symlinks pointing at user-writable targets"
+        );
+
+        // The same symlink loaded as Untrusted is permitted (size still capped).
+        let read = read_config_file_bounded(&symlink_path, ConfigSource::Untrusted);
+        assert_eq!(read.as_deref(), Some("key = \"injected\""));
     }
 }

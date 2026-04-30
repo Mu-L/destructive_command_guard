@@ -252,8 +252,30 @@ impl PendingExceptionStore {
         let mut file = open_locked(&self.path)?;
         let (active, maintenance) = load_active_from_file(&mut file, now, allow_once_audit);
 
-        if maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0 {
-            rewrite_records(&mut file, &active)?;
+        // Rotate before deciding how to write. If the active set is over the
+        // cap, archive the oldest portion to `pending.jsonl.1` and only
+        // retain the newest half in the live file. This keeps every future
+        // record_block call O(MAX_PENDING_LINES / 2) instead of unbounded.
+        let did_prune = maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0;
+        let pre_rotate_len = active.len();
+        let active_after_rotate = if active.len() > MAX_PENDING_LINES {
+            rotate_overflow(&active, &self.path)?
+        } else {
+            active
+        };
+        let did_rotate = active_after_rotate.len() != pre_rotate_len;
+        if did_prune || did_rotate {
+            rewrite_records(&mut file, &active_after_rotate)?;
+        }
+
+        // Final hard cap: if the live file is somehow still over the byte
+        // cap (e.g. a single record is enormous), refuse the new entry
+        // rather than let it grow without bound. Returning an error fails
+        // closed at the call site, which is the safe behavior here.
+        if file.metadata()?.len() > MAX_PENDING_BYTES {
+            return Err(io::Error::other(format!(
+                "pending-exceptions file exceeds {MAX_PENDING_BYTES}-byte cap; refusing new entry"
+            )));
         }
 
         append_record(&mut file, &record)?;
@@ -1197,6 +1219,56 @@ fn load_allow_once_from_file(
     (active, maintenance)
 }
 
+/// Maximum active pending-exception records before rotation kicks in.
+///
+/// Bounds `record_block` to O(MAX_PENDING_LINES) on the hot path. With
+/// ~500 bytes per record, 10k records ≈ 5 MiB on disk — safely under
+/// `MAX_PENDING_BYTES`. Above this count, the oldest half is archived
+/// to `pending.jsonl.1` and only the newest half is retained in the
+/// live file, so an automation issuing many codes cannot turn the hot
+/// path into a pathological case.
+pub(crate) const MAX_PENDING_LINES: usize = 10_000;
+
+/// Hard refusal threshold for the live pending-exceptions file.
+///
+/// After rotation a single file should never exceed this. If the live
+/// file is somehow still above this cap, `record_block` refuses to add
+/// a new entry rather than letting the file grow without bound.
+pub(crate) const MAX_PENDING_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Archive the oldest portion of `records` to `path.with_extension("jsonl.1")`
+/// when the active set exceeds `MAX_PENDING_LINES`. Returns the records that
+/// should remain in the live file (newest half).
+fn rotate_overflow(
+    records: &[PendingExceptionRecord],
+    path: &Path,
+) -> io::Result<Vec<PendingExceptionRecord>> {
+    if records.len() <= MAX_PENDING_LINES {
+        return Ok(records.to_vec());
+    }
+    // Keep the newest MAX_PENDING_LINES / 2 — leaves comfortable headroom
+    // before another rotation, and matches typical log-rotation hysteresis.
+    let keep_from = records.len() - (MAX_PENDING_LINES / 2);
+    let archive_slice = &records[..keep_from];
+    let keep = records[keep_from..].to_vec();
+
+    let archive_path = path.with_extension("jsonl.1");
+    // Open in append mode so a prior rotation's archive isn't silently
+    // overwritten — the operator gets a growing audit trail until they
+    // manually compact it.
+    let mut archive = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&archive_path)?;
+    for record in archive_slice {
+        let line = serde_json::to_string(record).map_err(io::Error::other)?;
+        archive.write_all(line.as_bytes())?;
+        archive.write_all(b"\n")?;
+    }
+    archive.sync_data()?;
+    Ok(keep)
+}
+
 fn rewrite_records(file: &mut File, records: &[PendingExceptionRecord]) -> io::Result<()> {
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
@@ -1303,26 +1375,29 @@ fn compute_full_hash_with_secret(
     hex
 }
 
-/// Generate a 5-digit numeric short code from a hex hash.
+/// Generate a 6-digit numeric short code from a hex hash.
 ///
-/// Takes the last 8 hex characters (32 bits) and converts to a 5-digit
-/// decimal number (00000-99999). This provides 100,000 possible codes,
-/// which is more than the previous 65,536 (4 hex chars) while being
-/// easier to type and read.
+/// Takes the last 8 hex characters (32 bits) and converts to a 6-digit
+/// decimal number (000000-999999). The 6-digit codespace (1,000,000) raises
+/// the birthday-paradox 50% collision threshold from ~370 active records
+/// (5-digit / 100,000 codespace) to ~1,175 — well above realistic per-day
+/// volume in a 24-hour TTL window. Existing 5-digit codes in already-written
+/// pending.jsonl files continue to round-trip correctly because lookup is
+/// string-equal: the change only affects newly issued codes.
 fn short_code_from_hash(full_hash: &str) -> String {
     // Need at least 8 hex chars for a good distribution
     if full_hash.len() < 8 {
         // Fallback for edge cases: just use what we have as decimal
         let value = u32::from_str_radix(full_hash, 16).unwrap_or(0);
-        return format!("{:05}", value % 100_000);
+        return format!("{:06}", value % 1_000_000);
     }
 
     // Take last 8 hex characters (32 bits) and convert to decimal
     let hex_suffix = &full_hash[full_hash.len() - 8..];
     let value = u32::from_str_radix(hex_suffix, 16).unwrap_or(0);
 
-    // Mod by 100000 to get 5-digit code (00000-99999)
-    format!("{:05}", value % 100_000)
+    // Mod by 1_000_000 to get 6-digit code (000000-999999)
+    format!("{:06}", value % 1_000_000)
 }
 
 fn redact_for_pending(command: &str, redaction: &RedactionConfig) -> String {
@@ -1366,8 +1441,8 @@ mod tests {
             false,
             None,
         );
-        // Short code should be 5 digits
-        assert_eq!(record.short_code.len(), 5);
+        // Short code should be 6 digits
+        assert_eq!(record.short_code.len(), 6);
         // All characters should be numeric
         assert!(record.short_code.chars().all(|c| c.is_ascii_digit()));
         assert_eq!(record.full_hash.len(), 64);
@@ -1551,12 +1626,12 @@ mod tests {
             "17a268f67ce0aab3bc5015427e3ba8fd1d643d25f9f13dca1332c13818a5ac63"
         );
         assert_eq!(hash, hash.to_lowercase());
-        // Short code is now 5-digit numeric derived from last 8 hex chars
-        // 0x18a5ac63 = 413510755, 413510755 % 100000 = 10755
+        // Short code is now 6-digit numeric derived from last 8 hex chars
+        // 0x18a5ac63 = 413510755, 413510755 % 1_000_000 = 510755
         let short_code = short_code_from_hash(&hash);
-        assert_eq!(short_code.len(), 5);
+        assert_eq!(short_code.len(), 6);
         assert!(short_code.chars().all(|c| c.is_ascii_digit()));
-        assert_eq!(short_code, "10755");
+        assert_eq!(short_code, "510755");
     }
 
     #[test]
@@ -2124,7 +2199,7 @@ mod tests {
 
     #[test]
     fn test_numeric_code_generation() {
-        // Generate many codes and verify all are 5-digit numeric
+        // Generate many codes and verify all are 6-digit numeric
         for i in 0..1000 {
             // Create unique hashes by using different inputs
             let hash = compute_full_hash(
@@ -2135,8 +2210,8 @@ mod tests {
             let code = short_code_from_hash(&hash);
             assert_eq!(
                 code.len(),
-                5,
-                "Code '{code}' should be 5 characters, got {}",
+                6,
+                "Code '{code}' should be 6 characters, got {}",
                 code.len()
             );
             assert!(
@@ -2148,7 +2223,10 @@ mod tests {
 
     #[test]
     fn test_code_uniqueness() {
-        // Generate many codes and check collision rate
+        // Generate many codes and check collision rate against the new
+        // 1_000_000 codespace. Birthday paradox: expected collisions for
+        // 10000 samples in 1M space ~50 (vs ~500 for 100k), so we should
+        // see at least 9940 unique codes.
         let mut codes = std::collections::HashSet::new();
         for i in 0..10000 {
             let hash = compute_full_hash(
@@ -2158,38 +2236,35 @@ mod tests {
             );
             codes.insert(short_code_from_hash(&hash));
         }
-        // With 100000 possible codes, expect <1% collision rate for 10000 samples
-        // Birthday paradox: expected collisions ~500 for 10000 samples in 100000 space
-        // So we should have at least 9500 unique codes
         assert!(
-            codes.len() > 9400,
-            "Expected >9400 unique codes, got {}",
+            codes.len() > 9900,
+            "Expected >9900 unique codes (1M codespace), got {}",
             codes.len()
         );
     }
 
     #[test]
     fn test_code_format_validation() {
-        // Valid 5-digit codes
+        // Valid 6-digit codes
         fn is_valid_bypass_code(code: &str) -> bool {
-            code.len() == 5 && code.chars().all(|c| c.is_ascii_digit())
+            code.len() == 6 && code.chars().all(|c| c.is_ascii_digit())
         }
 
-        assert!(is_valid_bypass_code("12345"));
-        assert!(is_valid_bypass_code("00000"));
-        assert!(is_valid_bypass_code("99999"));
-        assert!(!is_valid_bypass_code("1234")); // Too short
-        assert!(!is_valid_bypass_code("123456")); // Too long
-        assert!(!is_valid_bypass_code("1234a")); // Contains letter
-        assert!(!is_valid_bypass_code("abcde")); // All letters
+        assert!(is_valid_bypass_code("123456"));
+        assert!(is_valid_bypass_code("000000"));
+        assert!(is_valid_bypass_code("999999"));
+        assert!(!is_valid_bypass_code("12345")); // Too short (old 5-digit)
+        assert!(!is_valid_bypass_code("1234567")); // Too long
+        assert!(!is_valid_bypass_code("12345a")); // Contains letter
+        assert!(!is_valid_bypass_code("abcdef")); // All letters
     }
 
     #[test]
     fn test_short_code_edge_cases() {
         // Test with very short hashes (edge case)
-        assert_eq!(short_code_from_hash("0").len(), 5);
-        assert_eq!(short_code_from_hash("abc").len(), 5);
-        assert_eq!(short_code_from_hash("1234567").len(), 5);
+        assert_eq!(short_code_from_hash("0").len(), 6);
+        assert_eq!(short_code_from_hash("abc").len(), 6);
+        assert_eq!(short_code_from_hash("1234567").len(), 6);
 
         // All should be numeric
         assert!(
@@ -2210,17 +2285,122 @@ mod tests {
 
         // Test with exactly 8 characters
         let code = short_code_from_hash("12345678");
-        assert_eq!(code.len(), 5);
+        assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
     }
 
     #[test]
     fn test_short_code_leading_zeros_preserved() {
-        // Create a hash that produces a small number to verify leading zeros
-        // 0x00000001 % 100000 = 1, should format as "00001"
+        // Create a hash that produces a small number to verify leading zeros.
+        // 0x00000001 % 1_000_000 = 1, should format as "000001"
         let code = short_code_from_hash("0000000000000001");
-        assert_eq!(code.len(), 5);
-        // The value is 1 % 100000 = 1, formatted as "00001"
-        assert_eq!(code, "00001");
+        assert_eq!(code.len(), 6);
+        assert_eq!(code, "000001");
+    }
+
+    // ========================================================================
+    // Rotation tests (git_safety_guard-f81d)
+    // ========================================================================
+
+    /// Build N synthetic active records that will not expire for the test.
+    fn synthetic_active_records(n: usize, base_now: DateTime<Utc>) -> Vec<PendingExceptionRecord> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut record = PendingExceptionRecord::new(
+                base_now,
+                "/repo",
+                &format!("git command-{i}"),
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+            );
+            // Push expiry well into the future so load_active_from_file
+            // doesn't prune them out from under us.
+            record.expires_at = format_timestamp(base_now + Duration::hours(48));
+            out.push(record);
+        }
+        out
+    }
+
+    #[test]
+    fn test_rotation_archives_oldest_when_over_cap() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        // record_block reads Utc::now() directly, so seed pre-records
+        // relative to wall-clock time so they aren't pruned as expired.
+        let now = Utc::now();
+
+        // Pre-populate the file with MAX_PENDING_LINES + 5 records.
+        let pre_records = synthetic_active_records(MAX_PENDING_LINES + 5, now);
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            for record in &pre_records {
+                let line = serde_json::to_string(record).unwrap();
+                use std::io::Write;
+                file.write_all(line.as_bytes()).unwrap();
+                file.write_all(b"\n").unwrap();
+            }
+        }
+
+        let store = PendingExceptionStore::new(path.clone());
+        let (_record, _maintenance) = store
+            .record_block(
+                "git brand-new",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+            )
+            .expect("record_block must succeed");
+
+        // Live file should now contain only newest half + the new record.
+        let (active, _) = store.load_active(Utc::now()).unwrap();
+        assert_eq!(
+            active.len(),
+            MAX_PENDING_LINES / 2 + 1,
+            "live file should hold newest half + the just-appended record"
+        );
+
+        // Archive file should exist with the oldest portion.
+        let archive = path.with_extension("jsonl.1");
+        assert!(archive.exists(), "rotation must create pending.jsonl.1");
+        let archived = std::fs::read_to_string(&archive).unwrap();
+        let archived_lines = archived.lines().count();
+        assert_eq!(
+            archived_lines,
+            (MAX_PENDING_LINES + 5) - (MAX_PENDING_LINES / 2),
+            "archive should hold every record above the keep threshold"
+        );
+    }
+
+    #[test]
+    fn test_record_block_under_cap_does_not_rotate() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+
+        let store = PendingExceptionStore::new(path.clone());
+        for i in 0..50 {
+            store
+                .record_block(
+                    &format!("git status-{i}"),
+                    "/repo",
+                    "blocked",
+                    &redaction_config(),
+                    false,
+                    None,
+                    None,
+                )
+                .expect("record_block");
+        }
+
+        // No archive file should be created under the cap.
+        let archive = path.with_extension("jsonl.1");
+        assert!(
+            !archive.exists(),
+            "below-cap activity must not create pending.jsonl.1"
+        );
     }
 }

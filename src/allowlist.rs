@@ -1244,19 +1244,25 @@ fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
         return AllowlistFile::default();
     }
 
-    let content = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            return AllowlistFile {
-                entries: Vec::new(),
-                errors: vec![AllowlistError {
-                    layer,
-                    path: path.to_path_buf(),
-                    entry_index: None,
-                    message: format!("failed to read allowlist file: {e}"),
-                }],
-            };
-        }
+    // System layer is privileged: refuse symlinks to user-writable targets.
+    // Other layers only enforce the size cap (still want bounded reads).
+    let source = if layer == AllowlistLayer::System {
+        crate::config::ConfigSource::System
+    } else {
+        crate::config::ConfigSource::Untrusted
+    };
+
+    let Some(content) = crate::config::read_config_file_bounded(path, source) else {
+        return AllowlistFile {
+            entries: Vec::new(),
+            errors: vec![AllowlistError {
+                layer,
+                path: path.to_path_buf(),
+                entry_index: None,
+                message: "failed to read allowlist file (missing, too large, or unsafe symlink)"
+                    .to_string(),
+            }],
+        };
     };
 
     parse_allowlist_toml(layer, path, &content)

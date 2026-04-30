@@ -163,7 +163,7 @@ fn rehydrate_hook_fixture(mut value: Value) -> Value {
     if output.get("allowOnceCode") == Some(&Value::String("<DYNAMIC>".to_string())) {
         output.insert(
             "allowOnceCode".to_string(),
-            Value::String("12345".to_string()),
+            Value::String("123456".to_string()),
         );
     }
     if output.get("allowOnceFullHash") == Some(&Value::String("<DYNAMIC>".to_string())) {
