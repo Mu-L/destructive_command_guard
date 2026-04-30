@@ -1686,7 +1686,13 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     // Use the optimized version that returns both decision and normalized form.
     let (quick_reject, normalized) =
         pack_aware_quick_reject_with_normalized(command_for_match, enabled_keywords);
-    if quick_reject {
+    if quick_reject
+        && !should_check_original_control_plane_payload_for_any_pack(
+            command_for_match,
+            command,
+            ordered_packs,
+        )
+    {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -1780,7 +1786,13 @@ fn evaluate_packs_with_allowlists(
                 .filter_map(|pack_id| {
                     // Try built-in registry first
                     if let Some(entry) = REGISTRY.get_entry(pack_id) {
-                        if !entry.might_match(command_for_packs) {
+                        if !entry.might_match(command_for_packs)
+                            && !should_check_original_control_plane_payload(
+                                pack_id,
+                                command_for_packs,
+                                original_command,
+                            )
+                        {
                             return None;
                         }
                         return Some((pack_id, entry.get_pack()));
@@ -1788,7 +1800,13 @@ fn evaluate_packs_with_allowlists(
                     // Fallback to external packs
                     if let Some(store) = external_store {
                         if let Some(pack) = store.get(pack_id) {
-                            if !pack.might_match(command_for_packs) {
+                            if !pack.might_match(command_for_packs)
+                                && !should_check_original_control_plane_payload(
+                                    pack_id,
+                                    command_for_packs,
+                                    original_command,
+                                )
+                            {
                                 return None;
                             }
                             return Some((pack_id, pack));
@@ -1804,7 +1822,13 @@ fn evaluate_packs_with_allowlists(
                 .iter()
                 .enumerate()
                 .filter_map(|(i, pack_id)| {
-                    if (mask >> i) & 1 == 0 {
+                    if (mask >> i) & 1 == 0
+                        && !should_check_original_control_plane_payload(
+                            pack_id,
+                            command_for_packs,
+                            original_command,
+                        )
+                    {
                         return None;
                     }
                     // Try built-in registry first
@@ -2129,9 +2153,43 @@ fn should_check_original_control_plane_payload(
 ) -> bool {
     // `curl -d/--data*` payloads are normally masked as inert data to avoid
     // generic false positives. Railway's API protections intentionally inspect
-    // GraphQL mutation payloads, so re-check only that control-plane pack on the
-    // original command after the sanitized pass misses.
-    command_for_packs != original_command && matches!(pack_id, "platform.railway")
+    // GraphQL mutation payloads, so re-check only that control-plane pack on an
+    // executing curl command after the sanitized pass misses. The original
+    // command must still carry a Railway API signal; this keeps documentation
+    // strings such as `echo 'projectDelete RAILWAY_API_TOKEN'` masked.
+    command_for_packs != original_command
+        && matches!(pack_id, "platform.railway")
+        && command_for_packs.contains("curl")
+        && original_command_contains_railway_api_signal(original_command)
+}
+
+fn should_check_original_control_plane_payload_for_any_pack(
+    command_for_packs: &str,
+    original_command: &str,
+    ordered_packs: &[String],
+) -> bool {
+    ordered_packs
+        .iter()
+        .any(|pack_id| {
+            should_check_original_control_plane_payload(
+                pack_id,
+                command_for_packs,
+                original_command,
+            )
+        })
+}
+
+fn original_command_contains_railway_api_signal(command: &str) -> bool {
+    [
+        "backboard.railway.app",
+        "backboard.railway.com",
+        "railway.app/graphql",
+        "railway.com/graphql",
+        "RAILWAY_API_URL",
+        "RAILWAY_API_TOKEN",
+    ]
+    .iter()
+    .any(|signal| command.contains(signal))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3314,6 +3372,40 @@ mod tests {
         assert_eq!(
             info.pattern_name.as_deref(),
             Some("railway-api-database-variable-upsert")
+        );
+    }
+
+    #[test]
+    fn railway_api_mutations_with_token_header_are_not_hidden_by_data_masking() {
+        let result = evaluate_with_pack_ids(
+            r#"curl https://api.example.com/graphql -H "Authorization: Bearer $RAILWAY_API_TOKEN" --data-binary '{"query":"mutation { projectDelete(id:\"p\") }"}'"#,
+            &["platform.railway"],
+        );
+
+        assert!(
+            result.is_denied(),
+            "Railway API mutation authenticated by token header must be blocked"
+        );
+        let info = result
+            .pattern_info
+            .expect("denial should include pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("railway-api-project-delete")
+        );
+    }
+
+    #[test]
+    fn masked_non_curl_documentation_stays_allowed_for_railway_api_terms() {
+        let result = evaluate_with_pack_ids(
+            r#"echo 'projectDelete with RAILWAY_API_TOKEN belongs in docs'"#,
+            &["platform.railway"],
+        );
+
+        assert!(
+            result.is_allowed(),
+            "masked documentation text should not activate Railway API inspection"
         );
     }
 
