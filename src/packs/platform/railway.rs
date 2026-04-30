@@ -264,7 +264,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-api-volume-detach",
-            r"(?i)(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN)).*volumeInstanceUpdate.*serviceId\s*:\s*null|volumeInstanceUpdate.*serviceId\s*:\s*null.*(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN))",
+            r#"(?i)(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN)).*volumeInstanceUpdate.*["']?serviceId["']?\s*:\s*null|volumeInstanceUpdate.*["']?serviceId["']?\s*:\s*null.*(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN))"#,
             "Railway Public API volume detach mutation detected.",
             High,
             "Railway GraphQL volumeInstanceUpdate with serviceId null detaches persistent storage from its service.",
@@ -423,6 +423,10 @@ mod tests {
                 "railway-api-volume-detach",
             ),
             (
+                r#"curl https://backboard.railway.app/graphql/v2 -d '{"query":"mutation($input: VolumeInstanceUpdateInput!) { volumeInstanceUpdate(input: $input) { id } }","variables":{"input":{"serviceId":null,"volumeId":"v"}}}'"#,
+                "railway-api-volume-detach",
+            ),
+            (
                 r#"curl https://backboard.railway.app/graphql/v2 -d '{"query":"mutation { variableDelete(input:{projectId:\"p\", environmentId:\"e\", name:\"DATABASE_URL\"}) }"}'"#,
                 "railway-api-variable-delete",
             ),
@@ -479,7 +483,7 @@ mod tests {
         for command in critical {
             let matched = pack
                 .check(command)
-                .unwrap_or_else(|| panic!("should block {command}"));
+                .expect("should block critical Railway command");
             assert_eq!(matched.severity, Severity::Critical, "command: {command}");
         }
 

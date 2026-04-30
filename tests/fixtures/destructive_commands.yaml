@@ -507,3 +507,5 @@ platform.railway:
     reason: "Deletes via Railway Public API"
   - command: "curl https://backboard.railway.app/graphql/v2 -d '{\"query\":\"mutation { volumeInstanceUpdate(input:{serviceId:null, volumeId:\\\"v\\\"}) }\"}'"
     reason: "Detaches a Railway volume via API"
+  - command: "curl https://backboard.railway.app/graphql/v2 -d '{\"query\":\"mutation($input: VolumeInstanceUpdateInput!) { volumeInstanceUpdate(input: $input) { id } }\",\"variables\":{\"input\":{\"serviceId\":null,\"volumeId\":\"v\"}}}'"
+    reason: "Detaches a Railway volume via API variables payload"
