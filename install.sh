@@ -1116,16 +1116,83 @@ configure_claude_code() {
   fi
 
   if [ -f "$settings_file" ]; then
-    # Check if dcg is already configured
-    if grep -q '"command".*dcg' "$settings_file" 2>/dev/null; then
-      # Also check if predecessor is still present (needs cleanup)
-      if grep -q 'git_safety_guard' "$settings_file" 2>/dev/null; then
-        : # Fall through to cleanup logic below
-      else
+    # Check if the exact current dcg hook is already configured. A stale dcg
+    # path, duplicate dcg entry, or predecessor hook that should be cleaned
+    # must fall through to the merge path.
+    if command -v python3 >/dev/null 2>&1; then
+      local claude_hook_state
+      claude_hook_state=$(python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+dcg_path = sys.argv[2]
+cleanup_predecessor = sys.argv[3] == "1" if len(sys.argv) > 3 else True
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r') as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    print("merge")
+    raise SystemExit(0)
+
+pre_tool_use = settings.get("hooks", {}).get("PreToolUse", [])
+if not isinstance(pre_tool_use, list):
+    print("merge")
+    raise SystemExit(0)
+
+dcg_commands = []
+predecessor_present = False
+for entry in pre_tool_use:
+    if not isinstance(entry, dict) or entry.get("matcher") != "Bash":
+        continue
+    hooks = entry.get("hooks", [])
+    if not isinstance(hooks, list):
+        continue
+    for hook in hooks:
+        if not isinstance(hook, dict):
+            continue
+        cmd = hook.get("command")
+        if isinstance(cmd, str) and "git_safety_guard" in cmd:
+            predecessor_present = True
+        if is_dcg_command(cmd):
+            dcg_commands.append(cmd)
+
+if cleanup_predecessor and predecessor_present:
+    print("merge")
+elif dcg_commands == [dcg_path]:
+    print("already")
+else:
+    print("merge")
+PYEOF
+)
+      if [ "$claude_hook_state" = "already" ]; then
         CLAUDE_STATUS="already"
         AUTO_CONFIGURED=1
         return 0
       fi
+    elif grep -q '"command".*dcg' "$settings_file" 2>/dev/null; then
+      # Fallback for systems without python3; the merge path below is also
+      # python-backed, so keep the historical cheap check in that environment.
+      CLAUDE_STATUS="already"
+      AUTO_CONFIGURED=1
+      return 0
     fi
 
     # Settings file exists, need to merge
