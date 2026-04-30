@@ -2166,8 +2166,8 @@ fn should_check_original_control_plane_payload(
 fn command_contains_curl_invocation(command: &str) -> bool {
     command
         .split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')'))
-        .map(|token| token.trim_matches(['"', '\'']))
-        .any(|token| token == "curl" || token.ends_with("/curl"))
+        .map(|word| word.trim_matches(['"', '\'']))
+        .any(|word| word == "curl" || word.ends_with("/curl"))
 }
 
 fn should_check_original_control_plane_payload_for_any_pack(
