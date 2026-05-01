@@ -1192,8 +1192,37 @@ PYEOF
     [ -f "$CURSOR_HOOKS_JSON" ]
     [ -f "$CURSOR_HOOK_SCRIPT" ]
     grep -qF "dcg-cursor-hook" "$CURSOR_HOOK_SCRIPT"
+    grep -qF "DCG_BIN_FALLBACK" "$CURSOR_HOOK_SCRIPT"
+    grep -qF "$DEST/dcg" "$CURSOR_HOOK_SCRIPT"
     assert_cursor_first_hook_command "$CURSOR_HOOK_SCRIPT"
     assert_cursor_hook_count 1
+}
+
+@test "configure_cursor: generated hook uses installed dcg path when PATH lacks dcg" {
+    log_test "Testing Cursor hook absolute dcg fallback..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    cat > "$DEST/dcg" << 'MOCKEOF'
+#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"blocked by mock dcg"}}'
+MOCKEOF
+    chmod +x "$DEST/dcg"
+
+    configure_cursor
+
+    local python_bin
+    python_bin="$(command -v python3)"
+    local output
+    output=$(PATH="/usr/bin:/bin" DCG_BIN= "$python_bin" "$CURSOR_HOOK_SCRIPT" <<'JSON'
+{"command":"rm -rf /","cwd":""}
+JSON
+)
+
+    log_test "Cursor hook output: $output"
+    [[ "$output" == *'"permission": "deny"'* ]]
+    [[ "$output" == *'blocked by mock dcg'* ]]
 }
 
 @test "configure_cursor: does not treat hook script path outside entries as installed" {
