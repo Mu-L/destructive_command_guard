@@ -1130,6 +1130,132 @@ EOF
 }
 
 # ============================================================================
+# Cursor IDE Configuration Tests
+# ============================================================================
+
+setup_mock_cursor() {
+    mkdir -p "$HOME/.cursor"
+}
+
+assert_cursor_first_hook_command() {
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    python3 - "$CURSOR_HOOKS_JSON" "$1" <<'PYEOF'
+import json
+import sys
+
+hooks_file, expected = sys.argv[1:3]
+with open(hooks_file, "r") as f:
+    config = json.load(f)
+
+actual = config["hooks"]["beforeShellExecution"][0]["command"]
+if actual != expected:
+    raise SystemExit(f"first Cursor hook was {actual!r}, expected {expected!r}")
+PYEOF
+}
+
+assert_cursor_hook_count() {
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    python3 - "$CURSOR_HOOKS_JSON" "$CURSOR_HOOK_SCRIPT" "$1" <<'PYEOF'
+import json
+import sys
+
+hooks_file, hook_cmd, expected_raw = sys.argv[1:4]
+expected = int(expected_raw)
+with open(hooks_file, "r") as f:
+    config = json.load(f)
+
+entries = config["hooks"]["beforeShellExecution"]
+count = sum(
+    1
+    for entry in entries
+    if isinstance(entry, dict) and entry.get("command") == hook_cmd
+)
+if count != expected:
+    raise SystemExit(f"Cursor hook count was {count}, expected {expected}")
+PYEOF
+}
+
+@test "configure_cursor: creates hooks json and generated hook script" {
+    log_test "Testing Cursor hook creation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+
+    configure_cursor
+
+    log_test "CURSOR_STATUS: $CURSOR_STATUS"
+    log_test "hooks.json: $(cat "$CURSOR_HOOKS_JSON" 2>/dev/null || echo 'missing')"
+
+    [ "$CURSOR_STATUS" = "created" ]
+    [ -f "$CURSOR_HOOKS_JSON" ]
+    [ -f "$CURSOR_HOOK_SCRIPT" ]
+    grep -qF "dcg-cursor-hook" "$CURSOR_HOOK_SCRIPT"
+    assert_cursor_first_hook_command "$CURSOR_HOOK_SCRIPT"
+    assert_cursor_hook_count 1
+}
+
+@test "configure_cursor: does not treat hook script path outside entries as installed" {
+    log_test "Testing Cursor exact hook entry detection..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    cat > "$CURSOR_HOOKS_JSON" << EOF
+{
+  "version": 1,
+  "notes": "$CURSOR_HOOK_SCRIPT"
+}
+EOF
+
+    configure_cursor
+
+    log_test "CURSOR_STATUS: $CURSOR_STATUS"
+    log_test "hooks.json: $(cat "$CURSOR_HOOKS_JSON")"
+
+    [ "$CURSOR_STATUS" = "merged" ]
+    assert_cursor_first_hook_command "$CURSOR_HOOK_SCRIPT"
+    assert_cursor_hook_count 1
+    grep -qF '"notes"' "$CURSOR_HOOKS_JSON"
+}
+
+@test "configure_cursor: reorders current hook to first and removes duplicates" {
+    log_test "Testing Cursor hook reorder and duplicate cleanup..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    mkdir -p "$CURSOR_HOOK_DIR"
+    cat > "$CURSOR_HOOKS_JSON" << EOF
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "/opt/other-hook"
+      },
+      {
+        "command": "$CURSOR_HOOK_SCRIPT"
+      },
+      {
+        "command": "$CURSOR_HOOK_SCRIPT"
+      }
+    ]
+  }
+}
+EOF
+
+    configure_cursor
+
+    log_test "CURSOR_STATUS: $CURSOR_STATUS"
+    log_test "hooks.json: $(cat "$CURSOR_HOOKS_JSON")"
+
+    [ "$CURSOR_STATUS" = "merged" ]
+    assert_cursor_first_hook_command "$CURSOR_HOOK_SCRIPT"
+    assert_cursor_hook_count 1
+    grep -qF "/opt/other-hook" "$CURSOR_HOOKS_JSON"
+}
+
+# ============================================================================
 # GitHub Copilot CLI Configuration Tests
 # ============================================================================
 

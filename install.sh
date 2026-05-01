@@ -2334,7 +2334,49 @@ PYEOF
   chmod +x "$hook_script" 2>/dev/null || true
 
   if [ -f "$settings_file" ]; then
-    if grep -q "$hook_script" "$settings_file" 2>/dev/null; then
+    local cursor_hook_state
+    cursor_hook_state=$(python3 - "$settings_file" "$hook_script" <<'PYEOF'
+import json
+import sys
+
+settings_file = sys.argv[1]
+hook_cmd = sys.argv[2]
+
+try:
+    with open(settings_file, "r") as f:
+        settings = json.load(f)
+except Exception:
+    print("merge")
+    raise SystemExit(0)
+
+if not isinstance(settings, dict):
+    print("merge")
+    raise SystemExit(0)
+
+hooks = settings.get("hooks", {})
+if not isinstance(hooks, dict):
+    print("merge")
+    raise SystemExit(0)
+
+entries = hooks.get("beforeShellExecution", [])
+if not isinstance(entries, list):
+    print("merge")
+    raise SystemExit(0)
+
+matching_commands = [
+    entry.get("command")
+    for entry in entries
+    if isinstance(entry, dict) and entry.get("command") == hook_cmd
+]
+first_command = entries[0].get("command") if entries and isinstance(entries[0], dict) else None
+
+if matching_commands == [hook_cmd] and first_command == hook_cmd:
+    print("already")
+else:
+    print("merge")
+PYEOF
+)
+    if [ "$cursor_hook_state" = "already" ]; then
       CURSOR_STATUS="already"
       AUTO_CONFIGURED=1
       return 0
@@ -2373,8 +2415,8 @@ hooks["beforeShellExecution"] = entries
 def is_match(entry):
     return isinstance(entry, dict) and entry.get("command") == hook_cmd
 
-if not any(is_match(entry) for entry in entries):
-    entries.insert(0, {"command": hook_cmd})
+entries[:] = [entry for entry in entries if not is_match(entry)]
+entries.insert(0, {"command": hook_cmd})
 
 with open(settings_file, "w") as f:
     json.dump(settings, f, indent=2)
