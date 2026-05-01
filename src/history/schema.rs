@@ -4360,6 +4360,19 @@ mod tests {
 
         std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
+        let permission_probe = dir_path.join("permission-probe");
+        let permissions_are_enforced = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&permission_probe)
+            .is_err();
+        if !permissions_are_enforced {
+            // Root-like test runners can write through 0444 directories, so
+            // this environment cannot exercise the PermissionDenied branch.
+            std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
         let db_path = dir_path.join("test.db");
         let result = HistoryDb::try_open(Some(db_path));
         assert!(result.is_none());

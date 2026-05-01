@@ -120,14 +120,15 @@ fn symlink_target_is_user_writable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
         let parent = target.parent().unwrap_or(&target);
         let Ok(meta) = fs::metadata(parent) else {
             return true;
         };
         // Anything not owned by root (uid 0) is treated as user-writable.
-        // This is conservative: a target owned by root in a non-root-only
-        // directory is still safer to refuse than load.
-        meta.uid() != 0
+        // Group/world-writable directories are also user-writable even when
+        // owned by root.
+        meta.uid() != 0 || (meta.permissions().mode() & 0o022) != 0
     }
     #[cfg(not(unix))]
     {
@@ -7841,10 +7842,15 @@ low = "disabled"
     #[cfg(unix)]
     #[test]
     fn read_config_file_bounded_system_rejects_user_writable_symlink_target() {
+        use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
         let temp = TempDir::new().expect("tempdir");
-        // Real (user-writable) target.
-        let target = temp.path().join("user_target.toml");
+        let user_writable_dir = temp.path().join("user-writable");
+        std::fs::create_dir(&user_writable_dir).unwrap();
+        std::fs::set_permissions(&user_writable_dir, std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        // Real target in a user-writable directory.
+        let target = user_writable_dir.join("user_target.toml");
         std::fs::write(&target, "key = \"injected\"").unwrap();
         // Symlink at a location we'll claim is "system".
         let symlink_path = temp.path().join("system_config.toml");
