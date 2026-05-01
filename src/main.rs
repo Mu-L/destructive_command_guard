@@ -77,8 +77,6 @@ fn configure_colors() {
     }
 }
 
-const HISTORY_AGENT_TYPE: &str = "claude_code";
-
 fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) -> Option<PathBuf> {
     if let Ok(path) = std::env::var(ENV_HISTORY_DB_PATH) {
         return Some(PathBuf::from(path));
@@ -87,6 +85,7 @@ fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) ->
 }
 
 fn build_history_entry(
+    agent_type: &str,
     command: &str,
     working_dir: &str,
     outcome: HistoryOutcome,
@@ -98,7 +97,7 @@ fn build_history_entry(
     let eval_duration_us = u64::try_from(eval_duration.as_micros()).unwrap_or(u64::MAX);
 
     CommandEntry {
-        agent_type: HISTORY_AGENT_TYPE.to_string(),
+        agent_type: agent_type.to_string(),
         working_dir: working_dir.to_string(),
         command: command.to_string(),
         outcome,
@@ -342,6 +341,7 @@ fn main() {
     // Load configuration
     let config = Config::load();
     let detected_agent = detect_agent();
+    let history_agent_type = detected_agent.config_key();
 
     // Check if bypass is requested (escape hatch)
     if Config::is_bypassed() {
@@ -507,6 +507,7 @@ fn main() {
     if result.skipped_due_to_budget {
         if let Some(writer) = history_writer.as_ref() {
             let entry = build_history_entry(
+                history_agent_type,
                 &command,
                 &working_dir,
                 HistoryOutcome::Allow,
@@ -542,6 +543,7 @@ fn main() {
             }
 
             let entry = build_history_entry(
+                history_agent_type,
                 &command,
                 &working_dir,
                 HistoryOutcome::Allow,
@@ -559,6 +561,7 @@ fn main() {
         // Fail open: structurally unexpected, but hook safety wins.
         if let Some(writer) = history_writer.as_ref() {
             let entry = build_history_entry(
+                history_agent_type,
                 &command,
                 &working_dir,
                 HistoryOutcome::Allow,
@@ -620,6 +623,7 @@ fn main() {
             DecisionMode::Log => HistoryOutcome::Allow,
         };
         let entry = build_history_entry(
+            history_agent_type,
             &command,
             &working_dir,
             outcome,
@@ -666,6 +670,7 @@ fn main() {
                 );
                 if let Some(writer) = history_writer.as_ref() {
                     let entry = build_history_entry(
+                        history_agent_type,
                         &command,
                         &working_dir,
                         HistoryOutcome::Allow,
@@ -1072,6 +1077,28 @@ mod tests {
         fn rejects_invalid_json() {
             assert_eq!(parse_and_get_command("not json"), None);
             assert_eq!(parse_and_get_command("{invalid}"), None);
+        }
+    }
+
+    mod history_entry_tests {
+        use super::*;
+
+        #[test]
+        fn build_history_entry_uses_detected_agent_key() {
+            let entry = build_history_entry(
+                Agent::CodexCli.config_key(),
+                "git status",
+                "/tmp/project",
+                HistoryOutcome::Allow,
+                Duration::from_micros(42),
+                None,
+                None,
+                None,
+            );
+
+            assert_eq!(entry.agent_type, "codex-cli");
+            assert_eq!(entry.command, "git status");
+            assert_eq!(entry.eval_duration_us, 42);
         }
     }
 
