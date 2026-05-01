@@ -560,10 +560,16 @@ fn nul_separated_args_to_string(bytes: &[u8]) -> Option<String> {
 /// merely *contains* an agent name without *being* one.
 ///
 /// The whitespace tokenization handles wrapper-style invocations like
-/// `node /usr/local/bin/codex`: each argv entry is checked independently and
-/// the first exact basename match wins.
+/// `node /usr/local/bin/codex`: the first argv token is treated as the process
+/// executable, while later tokens are only considered when they look like
+/// path-like executable/script arguments. This avoids misclassifying ordinary
+/// arguments such as `cargo test codex` or URL paths ending in `/codex`.
 fn agent_from_process_name(process_name: &str) -> Option<Agent> {
-    for token in process_name.split_whitespace() {
+    for (index, token) in process_name.split_whitespace().enumerate() {
+        if index > 0 && !is_path_like_process_token(token) {
+            continue;
+        }
+
         if let Some(agent) = agent_for_basename(executable_basename(token).as_str()) {
             return Some(agent);
         }
@@ -571,8 +577,18 @@ fn agent_from_process_name(process_name: &str) -> Option<Agent> {
     None
 }
 
+fn is_path_like_process_token(token: &str) -> bool {
+    let token = token.trim_matches(['"', '\'']);
+    !token.starts_with('-')
+        && !token.contains("://")
+        && (token.contains('/') || token.contains('\\'))
+}
+
 fn executable_basename(token: &str) -> String {
-    let normalized = token.to_lowercase().replace('\\', "/");
+    let normalized = token
+        .trim_matches(['"', '\''])
+        .to_lowercase()
+        .replace('\\', "/");
     let last = normalized.rsplit('/').next().unwrap_or(&normalized);
     for suffix in WINDOWS_EXECUTABLE_SUFFIXES {
         if let Some(stem) = last.strip_suffix(suffix) {
@@ -761,8 +777,14 @@ mod tests {
     fn test_agent_from_process_name_ignores_unknown_processes() {
         assert_eq!(agent_from_process_name("zsh"), None);
         assert_eq!(agent_from_process_name("cargo test agent"), None);
+        assert_eq!(agent_from_process_name("cargo test codex"), None);
         assert_eq!(agent_from_process_name("node"), None);
         assert_eq!(agent_from_process_name("curl https://codex.com"), None);
+        assert_eq!(
+            agent_from_process_name("curl https://example.com/codex"),
+            None
+        );
+        assert_eq!(agent_from_process_name("git commit -m codex"), None);
     }
 
     #[test]
@@ -818,6 +840,14 @@ mod tests {
         // Wrapper invocations: tokenize argv, basename each token, exact match.
         assert_eq!(
             agent_from_process_name("node /usr/local/bin/codex --foo"),
+            Some(Agent::CodexCli)
+        );
+        assert_eq!(
+            agent_from_process_name("node ./bin/gemini --foo"),
+            Some(Agent::GeminiCli)
+        );
+        assert_eq!(
+            agent_from_process_name(r#"node "C:\Users\dev\AppData\Roaming\npm\codex.cmd""#),
             Some(Agent::CodexCli)
         );
         // First-token wins on ties.
