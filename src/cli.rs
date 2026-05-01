@@ -121,6 +121,8 @@ pub struct Cli {
     #[arg(
         short,
         long,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::FalseyValueParser::new(),
         global = true,
         conflicts_with = "verbose",
         env = "DCG_QUIET"
@@ -128,15 +130,33 @@ pub struct Cli {
     pub quiet: bool,
 
     /// Use legacy output rendering (fallback if rich output causes issues)
-    #[arg(long, global = true, env = "DCG_LEGACY_OUTPUT")]
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::FalseyValueParser::new(),
+        global = true,
+        env = "DCG_LEGACY_OUTPUT"
+    )]
     pub legacy_output: bool,
 
     /// Disable colored output globally
-    #[arg(long, global = true, env = "DCG_NO_COLOR")]
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::FalseyValueParser::new(),
+        global = true,
+        env = "DCG_NO_COLOR"
+    )]
     pub no_color: bool,
 
     /// Disable suggestion output in warnings/denials
-    #[arg(long, global = true, env = "DCG_NO_SUGGESTIONS")]
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::FalseyValueParser::new(),
+        global = true,
+        env = "DCG_NO_SUGGESTIONS"
+    )]
     pub no_suggestions: bool,
 
     /// Enable robot/machine mode for AI agent integration

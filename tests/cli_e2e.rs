@@ -33,6 +33,24 @@ fn run_dcg(args: &[&str]) -> std::process::Output {
         .expect("failed to execute dcg")
 }
 
+fn run_dcg_with_env(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(dcg_binary());
+    cmd.args(args)
+        .env_remove("DCG_VERBOSE")
+        .env_remove("DCG_QUIET")
+        .env_remove("DCG_LEGACY_OUTPUT")
+        .env_remove("DCG_NO_COLOR")
+        .env_remove("DCG_NO_SUGGESTIONS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+
+    cmd.output().expect("failed to execute dcg")
+}
+
 #[derive(Debug)]
 struct HookRunOutput {
     command: String,
@@ -100,6 +118,38 @@ fn run_dcg_hook_with_env(command: &str, extra_env: &[(&str, &std::ffi::OsStr)]) 
 
 fn run_dcg_hook(command: &str) -> HookRunOutput {
     run_dcg_hook_with_env(command, &[])
+}
+
+#[test]
+fn documented_global_boolean_env_values_do_not_fail_clap_parsing() {
+    let flag_envs = [
+        "DCG_QUIET",
+        "DCG_LEGACY_OUTPUT",
+        "DCG_NO_COLOR",
+        "DCG_NO_SUGGESTIONS",
+    ];
+    let values = [
+        "1", "true", "yes", "on", "anything", "0", "false", "no", "off",
+    ];
+
+    for env_name in flag_envs {
+        for value in values {
+            let output = run_dcg_with_env(
+                &["test", "--format", "json", "git status"],
+                &[(env_name, value)],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert!(
+                output.status.success(),
+                "{env_name}={value:?} should not fail CLI parsing\nstderr:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("invalid value"),
+                "{env_name}={value:?} should not be rejected as an invalid boolean\nstderr:\n{stderr}"
+            );
+        }
+    }
 }
 
 // ============================================================================
