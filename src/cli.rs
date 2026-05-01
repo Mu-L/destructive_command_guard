@@ -10351,25 +10351,180 @@ fn handle_version_check(
     Ok(())
 }
 
-fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    // Tag-pin the installer URL so the install.sh that runs is the one
-    // that shipped with the requested version (not whatever is on `main`).
-    //
-    // Per `git_safety_guard-ythp`, we additionally:
-    //   1. Download install.sh to a temp file (no piping to `bash`)
-    //   2. Best-effort fetch install.sh.sha256 from the matching release
-    //   3. If the sha256 file is present, verify before exec — abort on
-    //      mismatch. Older tags (pre-ythp release) won't have the sha256;
-    //      we warn and proceed (preserving update path for stale binaries).
-    let target_tag = update
-        .version
-        .clone()
-        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
-    let normalized_tag = if target_tag.starts_with('v') {
-        target_tag.clone()
-    } else {
-        format!("v{target_tag}")
+fn normalize_release_tag(version: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let trimmed = version.trim();
+    let semver_text = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let parsed = match semver::Version::parse(semver_text) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid release version '{version}': {err}"),
+            )
+            .into());
+        }
     };
+    Ok(format!("v{parsed}"))
+}
+
+fn update_installer_tag_from_versions(
+    requested_version: Option<&str>,
+    latest_version: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    normalize_release_tag(requested_version.unwrap_or(latest_version))
+}
+
+fn update_installer_tag(
+    requested_version: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match requested_version {
+        Some(version) => {
+            update_installer_tag_from_versions(Some(version), env!("CARGO_PKG_VERSION"))
+        }
+        None => match crate::update::check_for_update(true) {
+            Ok(result) => update_installer_tag_from_versions(None, &result.latest_version),
+            Err(err) => {
+                eprintln!(
+                    "dcg update: failed to resolve latest release ({err}); falling back to current installer tag."
+                );
+                update_installer_tag_from_versions(None, env!("CARGO_PKG_VERSION"))
+            }
+        },
+    }
+}
+
+struct InstallerTempDir {
+    path: std::path::PathBuf,
+}
+
+impl InstallerTempDir {
+    fn create() -> Result<Self, Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir();
+        let process_id = std::process::id();
+        for attempt in 0..100_u32 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let path = base.join(format!("dcg-install-{process_id}-{nanos}-{attempt}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Failed to create a unique installer temp directory",
+        )
+        .into())
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for InstallerTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn try_download_file(
+    url: &str,
+    destination: &std::path::Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut command = if cfg!(windows) {
+        std::process::Command::new("curl.exe")
+    } else {
+        std::process::Command::new("curl")
+    };
+    let status = command
+        .arg("-fsSL")
+        .arg(url)
+        .arg("-o")
+        .arg(destination)
+        .status()?;
+
+    Ok(status.success())
+}
+
+fn download_file(
+    url: &str,
+    destination: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if try_download_file(url, destination)? {
+        Ok(())
+    } else {
+        Err(format!("Failed to download {url}").into())
+    }
+}
+
+fn verify_installer_checksum(
+    artifact_path: &std::path::Path,
+    checksum_path: &std::path::Path,
+    artifact_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fmt::Write as _;
+
+    use sha2::{Digest, Sha256};
+
+    let checksum_content = std::fs::read_to_string(checksum_path)?;
+    let expected = checksum_content
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("{artifact_name}.sha256 is empty"))?;
+    if expected.len() != 64 || !expected.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!("{artifact_name}.sha256 is malformed (need 64 hex chars)").into());
+    }
+
+    let artifact = std::fs::read(artifact_path)?;
+    let digest = Sha256::digest(&artifact);
+    let mut actual = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(actual, "{byte:02x}");
+    }
+    if expected.eq_ignore_ascii_case(&actual) {
+        Ok(())
+    } else {
+        Err(format!("{artifact_name} sha256 verification failed").into())
+    }
+}
+
+fn download_verified_installer(
+    script_url: &str,
+    sha_url: &str,
+    artifact_name: &str,
+) -> Result<(InstallerTempDir, std::path::PathBuf), Box<dyn std::error::Error>> {
+    let temp_dir = InstallerTempDir::create()?;
+    let script_path = temp_dir.path().join(artifact_name);
+    let checksum_path = temp_dir.path().join(format!("{artifact_name}.sha256"));
+
+    download_file(script_url, &script_path)?;
+    if try_download_file(sha_url, &checksum_path)? {
+        verify_installer_checksum(&script_path, &checksum_path, artifact_name)?;
+        eprintln!("dcg update: {artifact_name} sha256 verified.");
+    } else {
+        eprintln!(
+            "dcg update: {artifact_name}.sha256 not published for this tag; proceeding without verification."
+        );
+    }
+
+    Ok((temp_dir, script_path))
+}
+
+fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    // Tag-pin the installer URL so the install.sh that runs is from the
+    // requested version, or from the latest release for the default update path
+    // (not whatever is on `main`).
+    //
+    // Per `git_safety_guard-ythp`, we additionally download install.sh to a
+    // temp file and verify install.sh.sha256 when the matching release
+    // publishes it. Older tags will not have the checksum; we warn and proceed
+    // to preserve the update path for stale binaries.
+    let requested_version = update.version.clone();
+    let normalized_tag = update_installer_tag(requested_version.as_deref())?;
     let script_url = format!(
         "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.sh"
     );
@@ -10384,9 +10539,9 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
 
     let mut args: Vec<String> = Vec::new();
 
-    if let Some(version) = update.version {
+    if requested_version.is_some() {
         args.push("--version".to_string());
-        args.push(version);
+        args.push(normalized_tag.clone());
     }
     if update.system {
         args.push("--system".to_string());
@@ -10417,68 +10572,12 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
         args.push("--no-configure".to_string());
     }
 
-    let mut escaped_args = String::new();
-    for (idx, arg) in args.iter().enumerate() {
-        if idx > 0 {
-            escaped_args.push(' ');
-        }
-        escaped_args.push_str(&shell_escape_posix(arg));
-    }
+    let (_temp_dir, script_path) =
+        download_verified_installer(&script_url, &sha_url, "install.sh")?;
 
-    // Download script + sha256 to a tempdir, verify, then exec from disk.
-    // Verification grammar matches what dist.yml produces (`shasum -a 256
-    // <script>` output: `<sha>  <basename>`). Older tags without the
-    // sha256 file warn and proceed (graceful degradation for stale binaries
-    // updating into the new world).
-    let exec_args = if escaped_args.is_empty() {
-        String::new()
-    } else {
-        format!(" {escaped_args}")
-    };
-    // Pick the available SHA-256 verifier. `shasum -a 256 -c` and
-    // `sha256sum -c` both consume the same `<hex>  <basename>` line format
-    // so either works on the file `dist.yml` produces with `shasum -a 256`.
-    // Alpine and distroless containers ship `sha256sum` (coreutils) but
-    // not `shasum` (Perl); macOS ships `shasum` but not always
-    // `sha256sum`. If neither exists we warn and proceed — same posture as
-    // a missing `.sha256` file (preserves the update path).
-    let command = format!(
-        r#"set -e
-tmp="$(mktemp -d -t dcg-install.XXXXXX)"
-trap 'rm -rf "$tmp"' EXIT
-script="$tmp/install.sh"
-sha="$tmp/install.sh.sha256"
-curl -fsSL {script} -o "$script"
-verify_sha() {{
-  if command -v shasum >/dev/null 2>&1; then
-    ( cd "$tmp" && shasum -a 256 -c "$sha" )
-  elif command -v sha256sum >/dev/null 2>&1; then
-    ( cd "$tmp" && sha256sum -c "$sha" )
-  else
-    echo "dcg update: neither shasum nor sha256sum available — skipping verification." >&2
-    return 0
-  fi
-}}
-if curl -fsSL --output "$sha" {sha_url} 2>/dev/null; then
-  if verify_sha; then
-    echo "dcg update: install.sh sha256 verified."
-  else
-    echo "dcg update: install.sh sha256 verification FAILED — aborting." >&2
-    exit 1
-  fi
-else
-  echo "dcg update: install.sh.sha256 not published for this tag — proceeding without verification." >&2
-fi
-bash "$script"{exec_args}
-"#,
-        script = shell_escape_posix(&script_url),
-        sha_url = shell_escape_posix(&sha_url),
-        exec_args = exec_args,
-    );
-
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    let status = std::process::Command::new("bash")
+        .arg(&script_path)
+        .args(&args)
         .status()?;
 
     if !status.success() {
@@ -10503,15 +10602,8 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
     // Same tag-pinning + sha256 verification as `self_update_unix`. See
     // that function's comment for the full rationale (`git_safety_guard-ythp`).
-    let target_tag = update
-        .version
-        .clone()
-        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
-    let normalized_tag = if target_tag.starts_with('v') {
-        target_tag.clone()
-    } else {
-        format!("v{target_tag}")
-    };
+    let requested_version = update.version.clone();
+    let normalized_tag = update_installer_tag(requested_version.as_deref())?;
     let script_url = format!(
         "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.ps1"
     );
@@ -10523,14 +10615,13 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
     let mut args: Vec<String> = Vec::new();
 
-    if let Some(version) = update.version {
-        args.push(format!("-Version {}", shell_escape_powershell(&version)));
+    if requested_version.is_some() {
+        args.push("-Version".to_string());
+        args.push(normalized_tag.clone());
     }
     if let Some(dest) = update.dest {
-        args.push(format!(
-            "-Dest {}",
-            shell_escape_powershell(&dest.to_string_lossy())
-        ));
+        args.push("-Dest".to_string());
+        args.push(dest.to_string_lossy().into_owned());
     }
     if update.easy_mode {
         args.push("-EasyMode".to_string());
@@ -10539,63 +10630,16 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
         args.push("-Verify".to_string());
     }
 
-    let args_str = if args.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", args.join(" "))
-    };
-
-    // Download script + sha256 to %TEMP%, verify, then run. `dist.yml`
-    // publishes install.ps1.sha256 in the format `<sha>  install.ps1`
-    // (POSIX shasum convention). We compare the lower-cased PowerShell
-    // hash to the leading 64 hex chars of that line. If the .sha256 file
-    // is missing (older tag), warn and proceed.
-    // Download flow: separate the .sha256 fetch (which may legitimately
-    // 404 for older tags) from the verification (which must abort on any
-    // failure including a malformed .sha256). Lumping both in one try/catch
-    // would silently treat a corrupt .sha256 file as "not published" and
-    // proceed without verification — the wrong posture.
-    let command = format!(
-        "$ErrorActionPreference='Stop'; \
-$url={url}; \
-$shaUrl={sha_url}; \
-$tmp=Join-Path $env:TEMP 'dcg-install.ps1'; \
-$shaTmp=Join-Path $env:TEMP 'dcg-install.ps1.sha256'; \
-Invoke-WebRequest -Uri $url -OutFile $tmp; \
-$shaDownloaded=$false; \
-try {{ Invoke-WebRequest -Uri $shaUrl -OutFile $shaTmp -ErrorAction Stop; $shaDownloaded=$true; }} \
-catch {{ Write-Warning 'dcg update: install.ps1.sha256 not published for this tag — proceeding without verification.'; }} \
-if ($shaDownloaded) {{ \
-  $shaContent=(Get-Content $shaTmp -Raw).Trim(); \
-  if ($shaContent.Length -lt 64) {{ \
-    Write-Error 'dcg update: install.ps1.sha256 is malformed (need 64 hex chars) — aborting.'; \
-    Remove-Item $tmp,$shaTmp -ErrorAction SilentlyContinue; \
-    exit 1; \
-  }} \
-  $expected=$shaContent.Substring(0,64).ToLower(); \
-  $actual=(Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower(); \
-  if ($expected -ne $actual) {{ \
-    Write-Error 'dcg update: install.ps1 sha256 verification FAILED — aborting.'; \
-    Remove-Item $tmp,$shaTmp -ErrorAction SilentlyContinue; \
-    exit 1; \
-  }} \
-  Write-Host 'dcg update: install.ps1 sha256 verified.'; \
-}} \
-& $tmp{args}; \
-$code=$LASTEXITCODE; \
-Remove-Item $tmp,$shaTmp -ErrorAction SilentlyContinue; \
-exit $code;",
-        url = shell_escape_powershell(&script_url),
-        sha_url = shell_escape_powershell(&sha_url),
-        args = args_str
-    );
+    let (_temp_dir, script_path) =
+        download_verified_installer(&script_url, &sha_url, "install.ps1")?;
 
     let status = std::process::Command::new("powershell")
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
-        .arg("-Command")
-        .arg(command)
+        .arg("-File")
+        .arg(&script_path)
+        .args(&args)
         .status()?;
 
     if !status.success() {
@@ -10603,35 +10647,6 @@ exit $code;",
     }
 
     Ok(())
-}
-
-fn shell_escape_posix(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    let mut escaped = String::from("'");
-    for ch in value.chars() {
-        if ch == '\'' {
-            escaped.push_str("'\\''");
-        } else {
-            escaped.push(ch);
-        }
-    }
-    escaped.push('\'');
-    escaped
-}
-
-fn shell_escape_powershell(value: &str) -> String {
-    let mut escaped = String::from("'");
-    for ch in value.chars() {
-        if ch == '\'' {
-            escaped.push_str("''");
-        } else {
-            escaped.push(ch);
-        }
-    }
-    escaped.push('\'');
-    escaped
 }
 
 /// Get the path to user-level Claude Code settings (`~/.claude/settings.json`).
@@ -14299,6 +14314,36 @@ mod tests {
         } else {
             unreachable!("Expected Update command");
         }
+    }
+
+    #[test]
+    fn test_normalize_release_tag_adds_v_prefix() {
+        assert_eq!(normalize_release_tag("0.2.0").unwrap(), "v0.2.0");
+        assert_eq!(normalize_release_tag("v0.2.0").unwrap(), "v0.2.0");
+    }
+
+    #[test]
+    fn test_update_installer_tag_prefers_requested_version() {
+        assert_eq!(update_installer_tag(Some("0.2.0")).unwrap(), "v0.2.0");
+        assert_eq!(update_installer_tag(Some("v0.2.0")).unwrap(), "v0.2.0");
+    }
+
+    #[test]
+    fn test_update_installer_tag_defaults_to_latest_version() {
+        assert_eq!(
+            update_installer_tag_from_versions(None, "0.9.0").unwrap(),
+            "v0.9.0"
+        );
+        assert_eq!(
+            update_installer_tag_from_versions(None, "v0.9.0").unwrap(),
+            "v0.9.0"
+        );
+    }
+
+    #[test]
+    fn test_update_installer_tag_rejects_non_semver_tags() {
+        assert!(update_installer_tag(Some("../../main")).is_err());
+        assert!(update_installer_tag(Some("main")).is_err());
     }
 
     #[test]
