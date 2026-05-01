@@ -116,16 +116,27 @@ function Test-CodexHookAlreadyCurrent {
   if ($null -eq $hooks) { return $false }
 
   $dcgCommands = @()
+  $firstBashHookCommand = $null
+  $firstBashMatcherSeen = $false
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks "PreToolUse"))) {
     if ((Get-ObjectPropertyValue $entry "matcher") -ne "Bash") { continue }
-    foreach ($hook in (Get-JsonArray (Get-ObjectPropertyValue $entry "hooks"))) {
+    $entryHooks = Get-JsonArray (Get-ObjectPropertyValue $entry "hooks")
+    if (-not $firstBashMatcherSeen) {
+      $firstBashMatcherSeen = $true
+      if ($entryHooks.Count -gt 0) {
+        $firstBashHookCommand = [string](Get-ObjectPropertyValue $entryHooks[0] "command")
+      }
+    }
+    foreach ($hook in $entryHooks) {
       if (Test-DcgHookCommand $hook) {
         $dcgCommands += [string](Get-ObjectPropertyValue $hook "command")
       }
     }
   }
 
-  $dcgCommands.Count -eq 1 -and $dcgCommands[0] -eq $DcgPath
+  $dcgCommands.Count -eq 1 -and
+    $dcgCommands[0] -eq $DcgPath -and
+    $firstBashHookCommand -eq $DcgPath
 }
 
 function Configure-CodexHook {
