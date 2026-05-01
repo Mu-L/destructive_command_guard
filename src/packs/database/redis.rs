@@ -2,7 +2,7 @@
 //!
 //! This includes patterns for:
 //! - FLUSHALL/FLUSHDB commands
-//! - DEL with wildcards
+//! - KEYS/SCAN piped into DEL/UNLINK for mass key deletion
 //! - CONFIG RESETSTAT
 //! - DEBUG commands
 
@@ -39,33 +39,33 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // GET/MGET operations are safe
         safe_pattern!(
             "redis-get",
-            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE))\b).*\b(?:GET|MGET)\b"
+            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE|RESETSTAT)|xargs\s+(?:-\S+(?:\s+\S+)?\s+)*redis-cli(?:\s+\S+)*\s+(?:DEL|UNLINK))\b).*\b(?:GET|MGET)\b"
         ),
         // SCAN is safe (cursor-based iteration)
         safe_pattern!(
             "redis-scan",
-            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE))\b).*\bSCAN\b"
+            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE|RESETSTAT)|xargs\s+(?:-\S+(?:\s+\S+)?\s+)*redis-cli(?:\s+\S+)*\s+(?:DEL|UNLINK))\b).*\bSCAN\b"
         ),
         // INFO is safe (server info)
         safe_pattern!(
             "redis-info",
-            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE))\b).*\bINFO\b"
+            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE|RESETSTAT)|xargs\s+(?:-\S+(?:\s+\S+)?\s+)*redis-cli(?:\s+\S+)*\s+(?:DEL|UNLINK))\b).*\bINFO\b"
         ),
         // KEYS (read-only, though potentially slow)
         safe_pattern!(
             "redis-keys",
-            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE))\b).*\bKEYS\b"
+            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE|RESETSTAT)|xargs\s+(?:-\S+(?:\s+\S+)?\s+)*redis-cli(?:\s+\S+)*\s+(?:DEL|UNLINK))\b).*\bKEYS\b"
         ),
         // DBSIZE is safe
         safe_pattern!(
             "redis-dbsize",
-            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE))\b).*\bDBSIZE\b"
+            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE|RESETSTAT)|xargs\s+(?:-\S+(?:\s+\S+)?\s+)*redis-cli(?:\s+\S+)*\s+(?:DEL|UNLINK))\b).*\bDBSIZE\b"
         ),
         // CONFIG GET is read-only (only meaningful if no destructive CONFIG SET).
-        // The negative lookahead already filters CONFIG SET/REWRITE.
+        // The negative lookahead already filters destructive CONFIG subcommands.
         safe_pattern!(
             "redis-config-get",
-            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE))\b).*\bCONFIG\s+GET\b"
+            r"(?i)^(?!.*\b(?:FLUSHALL|FLUSHDB|DEBUG|SHUTDOWN|CONFIG\s+(?:SET|REWRITE|RESETSTAT)|xargs\s+(?:-\S+(?:\s+\S+)?\s+)*redis-cli(?:\s+\S+)*\s+(?:DEL|UNLINK))\b).*\bCONFIG\s+GET\b"
         ),
     ]
 }
@@ -107,7 +107,34 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              CLIENT INFO          # Shows current DB\n  \
              DBSIZE               # Keys in current DB\n  \
              KEYS '*' | head -20  # Sample keys (slow on large DBs)\n\n\
-             Consider SCAN + DEL for selective deletion."
+             Prefer audited per-key cleanup with a dry run and backup."
+        ),
+        // CONFIG RESETSTAT - erases operational counters used for diagnosis
+        destructive_pattern!(
+            "config-resetstat",
+            r"(?i)\bCONFIG\s+RESETSTAT\b",
+            "CONFIG RESETSTAT clears Redis runtime counters and can hide recent incidents.",
+            Medium,
+            "CONFIG RESETSTAT resets Redis statistics reported by INFO:\n\n\
+             - Command counters and error counters are cleared\n\
+             - Recent operational evidence can be lost\n\
+             - Capacity and incident analysis becomes harder\n\n\
+             Capture INFO and monitoring data first, then run this manually only when \
+             resetting observability counters is intentional."
+        ),
+        destructive_pattern!(
+            "mass-delete-pipeline",
+            r"(?i)\bredis-cli\b.*\b(?:KEYS\b|--scan\b|SCAN\b).*\|\s*xargs\s+(?:-\S+(?:\s+\S+)?\s+)*redis-cli(?:\s+\S+)*\s+(?:DEL|UNLINK)\b",
+            "Redis KEYS/SCAN piped to DEL/UNLINK can delete many keys at once.",
+            High,
+            "Piping Redis key enumeration into DEL or UNLINK can delete every matching key:\n\n\
+             - redis-cli KEYS '*' | xargs redis-cli DEL removes all returned keys\n\
+             - redis-cli --scan --pattern 'prefix:*' | xargs redis-cli UNLINK removes a whole key namespace\n\
+             - This bypasses Redis's lack of wildcard DEL by expanding keys client-side\n\n\
+             Safer alternatives:\n  \
+             redis-cli --scan --pattern 'prefix:*' | head -50  # inspect first\n  \
+             Count and back up affected keys before selective deletion\n  \
+             Prefer application-owned cleanup tooling with dry-run support"
         ),
         // DEBUG SEGFAULT - crashes the server
         destructive_pattern!(
@@ -291,9 +318,40 @@ mod tests {
         assert_eq!(m.name, Some("config-dangerous"));
 
         let m = pack
+            .check("redis-cli CONFIG RESETSTAT; redis-cli INFO")
+            .expect("CONFIG RESETSTAT compound with INFO must still block");
+        assert_eq!(m.name, Some("config-resetstat"));
+
+        let m = pack
             .check("redis-cli DEBUG SEGFAULT; redis-cli INFO")
             .expect("DEBUG SEGFAULT compound with INFO must still block");
         assert_eq!(m.name, Some("debug-crash"));
+    }
+
+    #[test]
+    fn key_enumeration_piped_to_delete_is_blocked() {
+        let pack = create_pack();
+
+        let m = pack
+            .check("redis-cli KEYS '*' | xargs redis-cli DEL")
+            .expect("KEYS piped into DEL should block");
+        assert_eq!(m.name, Some("mass-delete-pipeline"));
+
+        let m = pack
+            .check("redis-cli --scan --pattern 'prefix:*' | xargs -r redis-cli UNLINK")
+            .expect("--scan piped into UNLINK should block");
+        assert_eq!(m.name, Some("mass-delete-pipeline"));
+
+        let m = pack
+            .check("redis-cli --scan --pattern 'session:*' | xargs -n 100 redis-cli DEL")
+            .expect("xargs with an option value should still block");
+        assert_eq!(m.name, Some("mass-delete-pipeline"));
+
+        assert_no_safe_match(&pack, "redis-cli KEYS '*' | xargs redis-cli DEL");
+        assert_no_safe_match(
+            &pack,
+            "redis-cli --scan --pattern 'prefix:*' | xargs -r redis-cli UNLINK",
+        );
     }
 
     #[test]
@@ -306,6 +364,7 @@ mod tests {
         assert_blocks(&pack, "redis-cli SHUTDOWN", "SHUTDOWN");
         assert_blocks(&pack, "redis-cli SHUTDOWN NOSAVE", "SHUTDOWN");
         assert_blocks(&pack, "redis-cli SHUTDOWN SAVE", "SHUTDOWN");
+        assert_blocks(&pack, "redis-cli CONFIG RESETSTAT", "RESETSTAT");
         assert_blocks(&pack, "redis-cli CONFIG SET dir /tmp", "CONFIG SET");
         assert_blocks(&pack, "redis-cli CONFIG SET dbfilename x", "CONFIG SET");
         assert_blocks(&pack, "redis-cli CONFIG SET slaveof x", "CONFIG SET");
@@ -332,6 +391,12 @@ mod tests {
         assert_blocks_with_severity(&pack, "redis-cli DEBUG SEGFAULT", Severity::Critical);
         assert_blocks_with_severity(&pack, "redis-cli DEBUG SLEEP 10", Severity::High);
         assert_blocks_with_severity(&pack, "redis-cli SHUTDOWN", Severity::High);
+        assert_blocks_with_severity(&pack, "redis-cli CONFIG RESETSTAT", Severity::Medium);
+        assert_blocks_with_severity(
+            &pack,
+            "redis-cli --scan --pattern 'session:*' | xargs redis-cli DEL",
+            Severity::High,
+        );
         assert_blocks_with_severity(&pack, "redis-cli CONFIG SET dir /tmp", Severity::Critical);
         assert_blocks_with_severity(&pack, "redis-cli CONFIG REWRITE", Severity::High);
     }
