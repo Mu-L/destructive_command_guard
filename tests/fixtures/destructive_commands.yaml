@@ -220,6 +220,14 @@ storage.s3:
   - command: "aws s3api delete-bucket-policy --bucket my-bucket"
     reason: "Removes bucket policy"
 
+storage.gcs:
+  - command: "gcloud alpha --project prod storage buckets delete gs://prod-bucket --quiet"
+    reason: "Deletes a GCS bucket through the alpha gcloud storage track"
+  - command: "gcloud beta storage rm gs://prod-bucket/private.txt"
+    reason: "Deletes a GCS object through a release-track gcloud storage command"
+  - command: "gsutil rm gs://prod-bucket/private.txt"
+    reason: "Deletes a GCS object"
+
 search.elasticsearch:
   - command: "curl -X DELETE 'http://localhost:9200/logs-2024'"
     reason: "Deletes index"

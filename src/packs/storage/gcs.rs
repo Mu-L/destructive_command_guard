@@ -4,6 +4,7 @@
 //! - Bucket removal (gsutil rb, gcloud storage buckets delete)
 //! - Object deletion (gsutil rm, gcloud storage rm)
 //! - Recursive delete operations
+//! - GA and release-track gcloud storage forms
 
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
@@ -16,7 +17,7 @@ pub fn create_pack() -> Pack {
         name: "Google Cloud Storage",
         description: "Protects against destructive GCS operations like bucket removal, \
                       object deletion, and recursive deletes.",
-        keywords: &["gsutil", "gcloud storage"],
+        keywords: &["gsutil", "gcloud"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -47,31 +48,31 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // gcloud storage read operations
         safe_pattern!(
             "gcloud-storage-buckets-list",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+buckets\s+list(?=\s|$)"
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+buckets\s+list(?=\s|$)"
         ),
         safe_pattern!(
             "gcloud-storage-buckets-describe",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+buckets\s+describe(?=\s|$)"
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+buckets\s+describe(?=\s|$)"
         ),
         safe_pattern!(
             "gcloud-storage-objects-list",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+objects\s+list(?=\s|$)"
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+objects\s+list(?=\s|$)"
         ),
         safe_pattern!(
             "gcloud-storage-objects-describe",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+objects\s+describe(?=\s|$)"
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+objects\s+describe(?=\s|$)"
         ),
         safe_pattern!(
             "gcloud-storage-ls",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+ls(?=\s|$)"
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+ls(?=\s|$)"
         ),
         safe_pattern!(
             "gcloud-storage-cat",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+cat(?=\s|$)"
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+cat(?=\s|$)"
         ),
         safe_pattern!(
             "gcloud-storage-cp",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+cp(?=\s|$)"
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+cp(?=\s|$)"
         ),
     ]
 }
@@ -125,7 +126,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // gcloud storage bucket deletion
         destructive_pattern!(
             "gcloud-storage-buckets-delete",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+buckets\s+delete\b",
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+buckets\s+delete\b",
             "gcloud storage buckets delete removes a GCS bucket.",
             Critical,
             "Deleting a GCS bucket removes the bucket configuration and all objects within it \
@@ -139,7 +140,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // gcloud storage object deletion
         destructive_pattern!(
             "gcloud-storage-objects-delete",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+objects\s+delete\b",
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+objects\s+delete\b",
             "gcloud storage objects delete removes objects from GCS.",
             High,
             "Deleting GCS objects permanently removes data. Without object versioning, \
@@ -153,7 +154,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // gcloud storage rm
         destructive_pattern!(
             "gcloud-storage-rm",
-            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+rm\b",
+            r"gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+rm\b",
             "gcloud storage rm removes objects from GCS.",
             High,
             "The rm command deletes objects and can recursively remove entire bucket \
@@ -180,6 +181,7 @@ mod tests {
         assert_eq!(pack.name, "Google Cloud Storage");
         assert!(!pack.description.is_empty());
         assert!(pack.keywords.contains(&"gsutil"));
+        assert!(pack.keywords.contains(&"gcloud"));
 
         assert_patterns_compile(&pack);
         assert_all_patterns_have_reasons(&pack);
@@ -207,6 +209,10 @@ mod tests {
         assert_safe_pattern_matches(&pack, "gcloud storage ls gs://bucket");
         assert_safe_pattern_matches(&pack, "gcloud storage cat gs://bucket/file");
         assert_safe_pattern_matches(&pack, "gcloud storage cp gs://bucket/file ./local");
+        assert_safe_pattern_matches(&pack, "gcloud --project prod storage buckets list");
+        assert_safe_pattern_matches(&pack, "gcloud alpha storage buckets list");
+        assert_safe_pattern_matches(&pack, "gcloud alpha --project prod storage buckets list");
+        assert_safe_pattern_matches(&pack, "gcloud beta storage ls gs://bucket");
     }
 
     #[test]
@@ -247,6 +253,26 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "gcloud storage rm gs://bucket/file",
+            "gcloud-storage-rm",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud --project prod storage rm gs://bucket/file",
+            "gcloud-storage-rm",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud alpha storage buckets delete gs://bucket",
+            "gcloud-storage-buckets-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud alpha --project prod storage buckets delete gs://bucket",
+            "gcloud-storage-buckets-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud beta storage rm gs://bucket/file",
             "gcloud-storage-rm",
         );
     }
@@ -294,6 +320,16 @@ mod tests {
             "gcloud storage rm gs://bucket/file",
             "gcloud storage rm removes objects from GCS",
         );
+        assert_blocks(
+            &pack,
+            "gcloud alpha storage rm gs://bucket/file",
+            "gcloud storage rm removes objects from GCS",
+        );
+        assert_blocks(
+            &pack,
+            "gcloud alpha --project prod storage rm gs://bucket/file",
+            "gcloud storage rm removes objects from GCS",
+        );
     }
 
     #[test]
@@ -313,6 +349,11 @@ mod tests {
             Severity::High,
         );
         assert_blocks_with_severity(&pack, "gcloud storage rm gs://bucket/file", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud alpha storage buckets delete gs://bucket",
+            Severity::Critical,
+        );
     }
 
     #[test]
@@ -335,6 +376,10 @@ mod tests {
         assert_safe_pattern_matches(&pack, "gcloud storage ls gs://bucket");
         assert_safe_pattern_matches(&pack, "gcloud storage cat gs://bucket/file");
         assert_safe_pattern_matches(&pack, "gcloud storage cp gs://bucket/file ./local");
+        assert_safe_pattern_matches(&pack, "gcloud --project prod storage ls gs://bucket");
+        assert_safe_pattern_matches(&pack, "gcloud alpha storage ls gs://bucket");
+        assert_safe_pattern_matches(&pack, "gcloud alpha --project prod storage ls gs://bucket");
+        assert_safe_pattern_matches(&pack, "gcloud beta storage buckets describe gs://bucket");
     }
 
     #[test]

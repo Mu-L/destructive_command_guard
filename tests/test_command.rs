@@ -379,6 +379,34 @@ fn test_with_packs_checks_railway_function_delete() {
 }
 
 #[test]
+fn test_with_packs_checks_gcloud_alpha_storage_delete() {
+    let output = run_dcg_isolated(
+        &[
+            "test",
+            "--format",
+            "json",
+            "--with-packs",
+            "storage.gcs",
+            "gcloud alpha --project prod storage buckets delete gs://prod-bucket --quiet",
+        ],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "gcloud alpha storage bucket deletion should be blocked\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "storage.gcs");
+    assert_eq!(json["pattern_name"], "gcloud-storage-buckets-delete");
+}
+
+#[test]
 fn test_test_subcommand_help_text_includes_key_flags() {
     let output = run_dcg_isolated(&["help", "test"], None);
     let combined = format!("{}{}", stdout_text(&output), stderr_text(&output));

@@ -88,7 +88,7 @@ Protects against destructive GCS operations like bucket removal, object deletion
 Commands containing these keywords are checked against this pack:
 
 - `gsutil`
-- `gcloud storage`
+- `gcloud`
 
 ### Safe Patterns (Allowed)
 
@@ -104,13 +104,13 @@ These patterns match safe commands that are always allowed:
 | `gsutil-version` | `gsutil\s+(?:-[a-zA-Z]+\s+)*version(?=\s\|$)` |
 | `gsutil-help` | `gsutil\s+(?:-[a-zA-Z]+\s+)*help(?=\s\|$)` |
 | `gsutil-cp` | `gsutil\s+(?:-[a-zA-Z]+\s+)*cp(?=\s\|$)` |
-| `gcloud-storage-buckets-list` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+buckets\s+list(?=\s\|$)` |
-| `gcloud-storage-buckets-describe` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+buckets\s+describe(?=\s\|$)` |
-| `gcloud-storage-objects-list` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+objects\s+list(?=\s\|$)` |
-| `gcloud-storage-objects-describe` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+objects\s+describe(?=\s\|$)` |
-| `gcloud-storage-ls` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+ls(?=\s\|$)` |
-| `gcloud-storage-cat` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+cat(?=\s\|$)` |
-| `gcloud-storage-cp` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+cp(?=\s\|$)` |
+| `gcloud-storage-buckets-list` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha\|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+buckets\s+list(?=\s\|$)` |
+| `gcloud-storage-buckets-describe` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha\|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+buckets\s+describe(?=\s\|$)` |
+| `gcloud-storage-objects-list` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha\|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+objects\s+list(?=\s\|$)` |
+| `gcloud-storage-objects-describe` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha\|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+objects\s+describe(?=\s\|$)` |
+| `gcloud-storage-ls` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha\|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+ls(?=\s\|$)` |
+| `gcloud-storage-cat` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha\|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+cat(?=\s\|$)` |
+| `gcloud-storage-cp` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+(?:alpha\|beta)(?:\s+--?\S+(?:\s+\S+)?)*)?\s+storage\s+cp(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -285,4 +285,3 @@ risk_acknowledged = true
 ```
 
 ---
-

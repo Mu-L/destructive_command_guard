@@ -1018,7 +1018,7 @@ static PACK_ENTRIES: [PackEntry; 84] = [
     PackEntry::new("storage.s3", &["s3", "s3api"], storage::s3::create_pack),
     PackEntry::new(
         "storage.gcs",
-        &["gsutil", "gcloud storage"],
+        &["gsutil", "gcloud"],
         storage::gcs::create_pack,
     ),
     PackEntry::new("storage.minio", &["mc"], storage::minio::create_pack),
@@ -3130,34 +3130,81 @@ mod tests {
 
     #[test]
     fn pack_aware_quick_reject_handles_multiword_keywords_with_extra_space() {
-        let keywords: Vec<&str> = vec!["gcloud storage"];
+        let keywords: Vec<&str> = vec![
+            "gcloud storage",
+            "gcloud alpha storage",
+            "gcloud beta storage",
+        ];
 
         assert!(
             !pack_aware_quick_reject("gcloud   storage rm gs://bucket", &keywords),
             "multi-word keywords should match even with extra whitespace"
+        );
+        assert!(
+            !pack_aware_quick_reject("gcloud alpha   storage rm gs://bucket", &keywords),
+            "release-track multi-word keywords should match even with extra whitespace"
+        );
+        assert!(
+            !pack_aware_quick_reject("gcloud beta storage rm gs://bucket", &keywords),
+            "beta release-track multi-word keywords should not be quick-rejected"
         );
     }
 
     #[test]
     fn enabled_keyword_index_matches_multiword_keyword_with_extra_space() {
         let mut enabled = HashSet::new();
-        enabled.insert("storage.gcs".to_string());
+        enabled.insert("storage.azure_blob".to_string());
 
         let ordered = REGISTRY.expand_enabled_ordered(&enabled);
         let index = REGISTRY
             .build_enabled_keyword_index(&ordered)
             .expect("keyword index should build for small pack set");
 
-        let mask = index.candidate_pack_mask("gcloud   storage rm gs://bucket");
+        let mask = index.candidate_pack_mask("az   storage blob delete");
         let pack_idx = ordered
             .iter()
-            .position(|id| id == "storage.gcs")
-            .expect("storage.gcs should be present in ordered list");
+            .position(|id| id == "storage.azure_blob")
+            .expect("storage.azure_blob should be present in ordered list");
 
         assert_eq!(
             (mask >> pack_idx) & 1,
             1,
-            "candidate mask should include storage.gcs when whitespace varies"
+            "candidate mask should include storage.azure_blob when whitespace varies"
+        );
+    }
+
+    #[test]
+    fn storage_gcs_keyword_gate_handles_gcloud_wide_flags() {
+        let mut enabled = HashSet::new();
+        enabled.insert("storage.gcs".to_string());
+
+        let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+        assert!(
+            !pack_aware_quick_reject("gcloud --project prod storage rm gs://bucket", &keywords),
+            "gcloud-wide flags before storage must not quick-reject storage.gcs"
+        );
+        assert!(
+            !pack_aware_quick_reject(
+                "gcloud alpha --project prod storage rm gs://bucket",
+                &keywords,
+            ),
+            "release-track flags before storage must not quick-reject storage.gcs"
+        );
+
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("keyword index should build for small pack set");
+        let pack_idx = ordered
+            .iter()
+            .position(|id| id == "storage.gcs")
+            .expect("storage.gcs should be present in ordered list");
+        let mask = index.candidate_pack_mask("gcloud --project prod storage rm gs://bucket");
+
+        assert_eq!(
+            (mask >> pack_idx) & 1,
+            1,
+            "candidate mask should include storage.gcs for flag-interleaved gcloud storage"
         );
     }
 
