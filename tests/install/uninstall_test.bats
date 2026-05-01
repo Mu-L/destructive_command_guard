@@ -106,6 +106,74 @@ EOF
     grep -q "theme" "$HOME/.claude/settings.json"
 }
 
+@test "unconfigure_claude_code: ignores commands that only contain dcg as a substring" {
+    log_test "Testing Claude Code substring-only hook preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/settings.json" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/opt/dcgrep/bin/scan"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before=$(cat "$HOME/.claude/settings.json")
+
+    run unconfigure_claude_code
+
+    log_test "unconfigure_claude_code status: $status"
+    log_test "unconfigure_claude_code output: $output"
+    log_test "After: $(cat "$HOME/.claude/settings.json")"
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(cat "$HOME/.claude/settings.json")" = "$before" ]
+}
+
+@test "unconfigure_claude_code: preserves malformed Bash hook containers" {
+    log_test "Testing Claude Code malformed Bash hook preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/settings.json" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": {
+          "command": "/opt/dcgrep/bin/scan"
+        }
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before=$(cat "$HOME/.claude/settings.json")
+
+    run unconfigure_claude_code
+
+    log_test "unconfigure_claude_code status: $status"
+    log_test "unconfigure_claude_code output: $output"
+    log_test "After: $(cat "$HOME/.claude/settings.json")"
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(cat "$HOME/.claude/settings.json")" = "$before" ]
+}
+
 # ============================================================================
 # Gemini CLI Uninstall Tests
 # ============================================================================
@@ -138,6 +206,240 @@ EOF
 
     # dcg hook should be removed
     ! grep -q '"command".*dcg' "$HOME/.gemini/settings.json"
+}
+
+@test "unconfigure_gemini: ignores commands that only contain dcg as a substring" {
+    log_test "Testing Gemini CLI substring-only hook preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.gemini"
+    cat > "$HOME/.gemini/settings.json" << 'EOF'
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {"name": "dcgrep", "type": "command", "command": "/opt/dcgrep/bin/scan"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before=$(cat "$HOME/.gemini/settings.json")
+
+    run unconfigure_gemini
+
+    log_test "unconfigure_gemini status: $status"
+    log_test "unconfigure_gemini output: $output"
+    log_test "After: $(cat "$HOME/.gemini/settings.json")"
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(cat "$HOME/.gemini/settings.json")" = "$before" ]
+}
+
+@test "unconfigure_gemini: preserves malformed hook containers" {
+    log_test "Testing Gemini CLI malformed hook preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.gemini"
+    cat > "$HOME/.gemini/settings.json" << 'EOF'
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": {
+          "command": "/opt/dcgrep/bin/scan"
+        }
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before=$(cat "$HOME/.gemini/settings.json")
+
+    run unconfigure_gemini
+
+    log_test "unconfigure_gemini status: $status"
+    log_test "unconfigure_gemini output: $output"
+    log_test "After: $(cat "$HOME/.gemini/settings.json")"
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(cat "$HOME/.gemini/settings.json")" = "$before" ]
+}
+
+# ============================================================================
+# GitHub Copilot CLI Uninstall Tests
+# ============================================================================
+
+@test "unconfigure_copilot: ignores commands that only contain dcg as a substring" {
+    log_test "Testing GitHub Copilot CLI substring-only hook preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    command -v git &>/dev/null || skip "git not available"
+    extract_uninstall_functions
+
+    mkdir -p "$TEST_TMPDIR/repo"
+    cd "$TEST_TMPDIR/repo"
+    git init -q
+    mkdir -p .github/hooks
+    cat > .github/hooks/dcg.json << 'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "/opt/dcgrep/bin/scan",
+        "powershell": "/opt/dcgrep/bin/scan",
+        "cwd": ".",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before=$(cat .github/hooks/dcg.json)
+
+    run unconfigure_copilot
+
+    log_test "unconfigure_copilot status: $status"
+    log_test "unconfigure_copilot output: $output"
+    log_test "After: $(cat .github/hooks/dcg.json)"
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(cat .github/hooks/dcg.json)" = "$before" ]
+}
+
+@test "unconfigure_copilot: removes exact dcg command and preserves other entries" {
+    log_test "Testing GitHub Copilot CLI exact dcg hook removal..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    command -v git &>/dev/null || skip "git not available"
+    extract_uninstall_functions
+
+    mkdir -p "$TEST_TMPDIR/repo"
+    cd "$TEST_TMPDIR/repo"
+    git init -q
+    mkdir -p .github/hooks
+    cat > .github/hooks/dcg.json << 'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "/usr/local/bin/dcg",
+        "powershell": "/usr/local/bin/dcg",
+        "cwd": ".",
+        "timeoutSec": 30
+      },
+      {
+        "type": "command",
+        "bash": "/opt/dcgrep/bin/scan",
+        "powershell": "/opt/dcgrep/bin/scan",
+        "cwd": ".",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+EOF
+
+    run unconfigure_copilot
+
+    log_test "unconfigure_copilot status: $status"
+    log_test "unconfigure_copilot output: $output"
+    log_test "After: $(cat .github/hooks/dcg.json)"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    ! grep -qF '/usr/local/bin/dcg' .github/hooks/dcg.json
+    grep -qF '/opt/dcgrep/bin/scan' .github/hooks/dcg.json
+}
+
+# ============================================================================
+# Cursor IDE Uninstall Tests
+# ============================================================================
+
+@test "unconfigure_cursor: ignores commands that only contain dcg as a substring" {
+    log_test "Testing Cursor IDE substring-only hook preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.cursor"
+    cat > "$HOME/.cursor/hooks.json" << 'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "/opt/dcgrep/bin/scan"
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before=$(cat "$HOME/.cursor/hooks.json")
+
+    run unconfigure_cursor
+
+    log_test "unconfigure_cursor status: $status"
+    log_test "unconfigure_cursor output: $output"
+    log_test "After: $(cat "$HOME/.cursor/hooks.json")"
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(cat "$HOME/.cursor/hooks.json")" = "$before" ]
+}
+
+@test "unconfigure_cursor: removes generated hook script entry and preserves other entries" {
+    log_test "Testing Cursor IDE generated hook removal..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.cursor/hooks"
+    cat > "$HOME/.cursor/hooks/dcg-pre-shell.py" << 'EOF'
+#!/usr/bin/env python3
+# dcg-cursor-hook: generated by dcg installer
+EOF
+    chmod +x "$HOME/.cursor/hooks/dcg-pre-shell.py"
+    cat > "$HOME/.cursor/hooks.json" << EOF
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "$HOME/.cursor/hooks/dcg-pre-shell.py"
+      },
+      {
+        "command": "/opt/dcgrep/bin/scan"
+      }
+    ]
+  }
+}
+EOF
+
+    run unconfigure_cursor
+
+    log_test "unconfigure_cursor status: $status"
+    log_test "unconfigure_cursor output: $output"
+    log_test "After: $(cat "$HOME/.cursor/hooks.json")"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    [ ! -f "$HOME/.cursor/hooks/dcg-pre-shell.py" ]
+    ! grep -qF 'dcg-pre-shell.py' "$HOME/.cursor/hooks.json"
+    grep -qF '/opt/dcgrep/bin/scan' "$HOME/.cursor/hooks.json"
 }
 
 # ============================================================================

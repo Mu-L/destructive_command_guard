@@ -123,7 +123,7 @@ def is_dcg_command(cmd):
     custom-dcg-helper.sh). Since this code can DELETE entries, false
     positives correspond to data loss for the user's other tooling.
     """
-    if not cmd:
+    if not isinstance(cmd, str) or not cmd:
         return False
     try:
         tokens = shlex.split(cmd)
@@ -142,7 +142,11 @@ try:
 except (IOError, ValueError, json.JSONDecodeError):
     sys.exit(0)
 
+if not isinstance(settings, dict):
+    sys.exit(0)
 if 'hooks' not in settings:
+    sys.exit(0)
+if not isinstance(settings['hooks'], dict):
     sys.exit(0)
 if 'PreToolUse' not in settings['hooks']:
     sys.exit(0)
@@ -153,18 +157,27 @@ if not isinstance(pre_tool_use, list):
 
 # Filter out ONLY dcg hooks (basename match)
 new_hooks = []
+removed = False
 for entry in pre_tool_use:
     if isinstance(entry, dict) and entry.get('matcher') == 'Bash':
         hooks = entry.get('hooks', [])
+        if not isinstance(hooks, list):
+            new_hooks.append(entry)
+            continue
         filtered = [
             h for h in hooks
             if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
         ]
+        if len(filtered) != len(hooks):
+            removed = True
         if filtered:
             entry['hooks'] = filtered
             new_hooks.append(entry)
     else:
         new_hooks.append(entry)
+
+if not removed:
+    sys.exit(0)
 
 settings['hooks']['PreToolUse'] = new_hooks
 
@@ -205,7 +218,7 @@ settings_file = sys.argv[1]
 
 def is_dcg_command(cmd):
     """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
-    if not cmd:
+    if not isinstance(cmd, str) or not cmd:
         return False
     try:
         tokens = shlex.split(cmd)
@@ -224,7 +237,11 @@ try:
 except (IOError, ValueError, json.JSONDecodeError):
     sys.exit(0)
 
+if not isinstance(settings, dict):
+    sys.exit(0)
 if 'hooks' not in settings:
+    sys.exit(0)
+if not isinstance(settings['hooks'], dict):
     sys.exit(0)
 if 'BeforeTool' not in settings['hooks']:
     sys.exit(0)
@@ -235,18 +252,27 @@ if not isinstance(before_tool, list):
 
 # Filter out ONLY dcg hooks (basename match)
 new_hooks = []
+removed = False
 for entry in before_tool:
     if isinstance(entry, dict):
         hooks = entry.get('hooks', [])
+        if not isinstance(hooks, list):
+            new_hooks.append(entry)
+            continue
         filtered = [
             h for h in hooks
             if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
         ]
+        if len(filtered) != len(hooks):
+            removed = True
         if filtered:
             entry['hooks'] = filtered
             new_hooks.append(entry)
     else:
         new_hooks.append(entry)
+
+if not removed:
+    sys.exit(0)
 
 settings['hooks']['BeforeTool'] = new_hooks
 
@@ -287,6 +313,7 @@ unconfigure_copilot() {
         python3 - "$hook_file" <<'PYEOF'
 import json
 import os
+import shlex
 import sys
 
 hook_file = sys.argv[1]
@@ -308,12 +335,24 @@ pre_tool = hooks.get("preToolUse")
 if not isinstance(pre_tool, list):
     sys.exit(0)
 
+def is_dcg_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
 def is_dcg_entry(entry):
     if not isinstance(entry, dict):
         return False
-    bash_cmd = str(entry.get("bash", ""))
-    pwsh_cmd = str(entry.get("powershell", ""))
-    return "dcg" in bash_cmd or "dcg" in pwsh_cmd
+    return is_dcg_command(entry.get("bash")) or is_dcg_command(entry.get("powershell"))
 
 new_pre = [entry for entry in pre_tool if not is_dcg_entry(entry)]
 if len(new_pre) == len(pre_tool):
@@ -510,6 +549,7 @@ unconfigure_cursor() {
             python3 - "$hooks_json" <<'PYEOF'
 import json
 import os
+import shlex
 import sys
 
 hooks_file = sys.argv[1]
@@ -531,7 +571,22 @@ entries = hooks.get("beforeShellExecution")
 if not isinstance(entries, list):
     sys.exit(0)
 
-new_entries = [e for e in entries if not (isinstance(e, dict) and "dcg" in str(e.get("command", "")))]
+def is_dcg_cursor_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    return name == "dcg-pre-shell.py"
+
+new_entries = [
+    entry for entry in entries
+    if not (isinstance(entry, dict) and is_dcg_cursor_command(entry.get("command")))
+]
 if len(new_entries) == len(entries):
     sys.exit(0)
 
