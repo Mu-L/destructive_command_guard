@@ -39,6 +39,8 @@ use serde::{Deserialize, Serialize};
 /// Agent detection is stable within a process, so we use a longer TTL.
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
+const WINDOWS_EXECUTABLE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ".com", ".ps1"];
+
 /// Known AI coding agents that dcg can detect and configure per-agent policies for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -572,7 +574,12 @@ fn agent_from_process_name(process_name: &str) -> Option<Agent> {
 fn executable_basename(token: &str) -> String {
     let normalized = token.to_lowercase().replace('\\', "/");
     let last = normalized.rsplit('/').next().unwrap_or(&normalized);
-    last.strip_suffix(".exe").unwrap_or(last).to_string()
+    for suffix in WINDOWS_EXECUTABLE_SUFFIXES {
+        if let Some(stem) = last.strip_suffix(suffix) {
+            return stem.to_string();
+        }
+    }
+    last.to_string()
 }
 
 fn agent_for_basename(basename: &str) -> Option<Agent> {
@@ -740,6 +747,14 @@ mod tests {
             agent_from_process_name(r"C:\Users\dev\AppData\Local\Programs\Cursor\Cursor.exe"),
             Some(Agent::CursorIde)
         );
+        assert_eq!(
+            agent_from_process_name(r"C:\Users\dev\AppData\Roaming\npm\codex.cmd"),
+            Some(Agent::CodexCli)
+        );
+        assert_eq!(
+            agent_from_process_name("gemini.ps1"),
+            Some(Agent::GeminiCli)
+        );
     }
 
     #[test]
@@ -880,6 +895,7 @@ mod env_tests {
         "GEMINI_CLI",
         "COPILOT_CLI",
         "COPILOT_AGENT_START_TIME_SEC",
+        "CURSOR_IDE",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -1030,29 +1046,46 @@ mod env_tests {
     }
 
     #[test]
+    fn test_detect_cursor_ide_env() {
+        with_env_var("CURSOR_IDE", "1", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::CursorIde);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("CURSOR_IDE".to_string()));
+        });
+    }
+
+    #[test]
     fn test_detect_unknown_no_env() {
         // Acquire lock to prevent race conditions with parallel tests
         let _lock = ENV_LOCK.lock().unwrap();
+
+        let saved: Vec<_> = AGENT_ENV_VARS
+            .iter()
+            .map(|&k| (k, std::env::var(k).ok()))
+            .collect();
 
         // Ensure no agent env vars are set
         clear_cache();
         // SAFETY: We hold ENV_LOCK during this test, preventing concurrent
         // modifications to environment variables.
         unsafe {
-            std::env::remove_var("CLAUDE_CODE");
-            std::env::remove_var("CLAUDE_SESSION_ID");
-            std::env::remove_var("AUGMENT_AGENT");
-            std::env::remove_var("AUGMENT_CONVERSATION_ID");
-            std::env::remove_var("AIDER_SESSION");
-            std::env::remove_var("CONTINUE_SESSION_ID");
-            std::env::remove_var("CODEX_CLI");
-            std::env::remove_var("GEMINI_CLI");
-            std::env::remove_var("COPILOT_CLI");
-            std::env::remove_var("COPILOT_AGENT_START_TIME_SEC");
+            for &k in AGENT_ENV_VARS {
+                std::env::remove_var(k);
+            }
         }
 
         // Detection should fall back to process detection or Unknown
         let result = detect_agent_with_details();
+        unsafe {
+            for (k, v) in saved {
+                if let Some(val) = v {
+                    std::env::set_var(k, val);
+                }
+            }
+        }
+        clear_cache();
+
         // On most test runners, we'll get Unknown since they're not running
         // under an AI agent
         assert!(
