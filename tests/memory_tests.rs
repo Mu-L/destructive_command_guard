@@ -783,8 +783,14 @@ fn memory_leak_self_test() {
 
     let result = std::panic::catch_unwind(|| {
         assert_no_leak("intentional_leak", 100, 1024 * 1024, || {
-            let leaked: Vec<u8> = vec![0u8; 1024 * 1024];
-            std::mem::forget(leaked);
+            const LEAK_BYTES: usize = 64 * 1024;
+
+            // Touch non-zero pages so optimized Linux builds show the leak in RSS.
+            let mut leaked = vec![0xA5u8; LEAK_BYTES].into_boxed_slice();
+            for byte in leaked.iter_mut().step_by(4096) {
+                *byte = (*byte).wrapping_add(1u8);
+            }
+            black_box(Box::leak(leaked).as_mut_ptr());
         });
     });
 

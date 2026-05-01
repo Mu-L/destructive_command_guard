@@ -3087,7 +3087,7 @@ mod tests {
             let executable = spans.executable_text(cmd);
 
             assert!(
-                !executable.iter().any(|span| *span == "status"),
+                !executable.contains(&"status"),
                 "fd redirection must not be classified as a command separator: {cmd}"
             );
         }
