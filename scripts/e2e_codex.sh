@@ -238,6 +238,16 @@ cleanup() {
 trap cleanup EXIT
 
 parse_args() {
+    require_option_value() {
+        local option="$1"
+        local value="${2-}"
+        if [[ -z "$value" ]]; then
+            echo "$option requires a value" >&2
+            usage >&2
+            exit 2
+        fi
+    }
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --verbose|-v)
@@ -249,14 +259,17 @@ parse_args() {
                 shift
                 ;;
             --artifacts)
+                require_option_value "$1" "${2-}"
                 ARTIFACTS_DIR="$2"
                 shift 2
                 ;;
             --codex-binary)
+                require_option_value "$1" "${2-}"
                 CODEX_BINARY="$2"
                 shift 2
                 ;;
             --dcg-binary)
+                require_option_value "$1" "${2-}"
                 DCG_BINARY="$2"
                 shift 2
                 ;;
@@ -265,10 +278,12 @@ parse_args() {
                 shift
                 ;;
             --filter)
+                require_option_value "$1" "${2-}"
                 FILTER="$2"
                 shift 2
                 ;;
             --timeout-sec)
+                require_option_value "$1" "${2-}"
                 TIMEOUT_SEC="$2"
                 shift 2
                 ;;
