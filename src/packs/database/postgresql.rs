@@ -147,8 +147,6 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // pg_dump without --clean is safe (backup only)
         safe_pattern!("pg-dump-no-clean", r"pg_dump\s+(?!.*--clean)(?!.*-c\b)"),
-        // psql with --dry-run or explain
-        safe_pattern!("psql-dry-run", r"psql\s+.*--dry-run"),
         // SELECT queries are safe
         safe_pattern!("select-query", r"(?i)^\s*SELECT\s+"),
     ]
@@ -348,6 +346,21 @@ mod tests {
         assert_safe_pattern_matches(&pack, "pg_dump mydb > backup.sql");
         assert_safe_pattern_matches(&pack, "SELECT * FROM users;");
         assert_safe_pattern_matches(&pack, "SELECT COUNT(*) FROM orders;");
+    }
+
+    #[test]
+    fn psql_dry_run_text_does_not_bypass_destructive_sql() {
+        let pack = create_pack();
+        assert_no_safe_match(&pack, "psql -c 'DROP TABLE users; --dry-run'");
+        assert_blocks_with_pattern(&pack, "psql -c 'DROP TABLE users; --dry-run'", "drop-table");
+        assert_no_safe_match(&pack, "psql --dry-run -c 'DROP TABLE users'");
+        assert_blocks_with_pattern(&pack, "psql --dry-run -c 'DROP TABLE users'", "drop-table");
+        assert_no_safe_match(&pack, "psql -c 'TRUNCATE users; --dry-run'");
+        assert_blocks_with_pattern(
+            &pack,
+            "psql -c 'TRUNCATE users; --dry-run'",
+            "truncate-table",
+        );
     }
 
     #[test]

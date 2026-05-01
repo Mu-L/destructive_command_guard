@@ -1204,6 +1204,8 @@ test_command_with_packs "apigeecli apis delete -n my-api" "block" "apigateway.ap
 test_command_with_packs "psql -c 'DROP DATABASE production;'" "block" "database.postgresql" "psql DROP DATABASE (postgresql pack enabled)"
 test_command_with_packs "psql -c 'DROP DATABASE IF EXISTS production;'" "block" "database.postgresql" "psql DROP DATABASE IF EXISTS (postgresql pack enabled)"
 test_command_with_packs "psql -c 'DROP TABLE IF EXISTS users;'" "block" "database.postgresql" "psql DROP TABLE IF EXISTS (postgresql pack enabled)"
+test_command_with_packs "psql -c 'DROP TABLE users; --dry-run'" "block" "database.postgresql" "psql DROP TABLE with dry-run comment (postgresql pack enabled)"
+test_command_with_packs "psql --dry-run -c 'DROP TABLE users;'" "block" "database.postgresql" "psql unsupported dry-run flag with DROP TABLE (postgresql pack enabled)"
 test_command_with_packs "psql -c 'TRUNCATE TABLE users RESTART IDENTITY;'" "block" "database.postgresql" "psql TRUNCATE ... RESTART IDENTITY (postgresql pack enabled)"
 test_command_with_packs "psql -c 'DELETE FROM users;'" "block" "database.postgresql" "psql DELETE without WHERE (postgresql pack enabled)"
 test_command_with_packs "psql -c 'SELECT 1;'" "allow" "database.postgresql" "psql SELECT (postgresql pack enabled, safe command)"

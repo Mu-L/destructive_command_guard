@@ -41,7 +41,6 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `pg-dump-no-clean` | `pg_dump\s+(?!.*--clean)(?!.*-c\b)` |
-| `psql-dry-run` | `psql\s+.*--dry-run` |
 | `select-query` | `(?i)^\s*SELECT\s+` |
 
 ### Destructive Patterns (Blocked)
