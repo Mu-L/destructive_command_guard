@@ -20,6 +20,8 @@ Patch release after v0.4.6 focused on Codex/Gemini installer reliability, hook p
 ### Codex & Installer Reliability
 
 - Preserved invalid Codex `~/.codex/hooks.json` files instead of overwriting them during Unix installer runs, with an explicit failure reason in the install summary ([a3fc05a](https://github.com/Dicklesworthstone/destructive_command_guard/commit/a3fc05a)).
+- Preserved malformed Codex hook shapes on both Unix and Windows installers, including non-object `hooks` values and non-list `PreToolUse` values, instead of replacing user-edited data ([7167be6](https://github.com/Dicklesworthstone/destructive_command_guard/commit/7167be6), [f0ca794](https://github.com/Dicklesworthstone/destructive_command_guard/commit/f0ca794)).
+- Removed self-service bypass commands from Codex-visible denial text, so Codex sees the block reason and an explicit no-bypass instruction instead of a command it can use to allowlist and rerun the destructive operation ([a4b9a84](https://github.com/Dicklesworthstone/destructive_command_guard/commit/a4b9a84)).
 - Made Gemini installer reruns reset `GEMINI_BACKUP` state at the start of `configure_gemini`, preventing stale backup paths from leaking between attempts ([762f3c7](https://github.com/Dicklesworthstone/destructive_command_guard/commit/762f3c7)).
 - Tightened Gemini hook detection so the installer recognizes the exact dcg hook shape and reports configuration failures rather than silently treating near-matches as success ([4c9fbb2](https://github.com/Dicklesworthstone/destructive_command_guard/commit/4c9fbb2)).
 
@@ -29,12 +31,14 @@ Patch release after v0.4.6 focused on Codex/Gemini installer reliability, hook p
 - Prevented broad API safe patterns from masking destructive method-bearing requests across packs, including `curl -XDELETE`, `curl --request=DELETE`, and attached-method forms such as `-XDELETE` / `--request=DELETE` ([bdb297f](https://github.com/Dicklesworthstone/destructive_command_guard/commit/bdb297f), [08ac8a3](https://github.com/Dicklesworthstone/destructive_command_guard/commit/08ac8a3), [79915f4](https://github.com/Dicklesworthstone/destructive_command_guard/commit/79915f4)).
 - Blocked Redis mass key deletion pipelines and Prometheus destructive API calls that were previously hidden by overly broad safe `GET` handling ([41ec95d](https://github.com/Dicklesworthstone/destructive_command_guard/commit/41ec95d), [9f01db0](https://github.com/Dicklesworthstone/destructive_command_guard/commit/9f01db0)).
 - Scoped Railway original-payload rechecks to relevant compound-command segments so safe Railway API queries are not tainted by unrelated text in later shell segments, while destructive Railway mutations remain blocked ([701630f](https://github.com/Dicklesworthstone/destructive_command_guard/commit/701630f)).
+- Blocked Railway API mutations split across shell line continuations ([3818efc](https://github.com/Dicklesworthstone/destructive_command_guard/commit/3818efc)).
 
 ### Pack Coverage
 
 - Added Railway function deletion coverage ([f15bdf6](https://github.com/Dicklesworthstone/destructive_command_guard/commit/f15bdf6)).
 - Expanded the Google Cloud Storage pack to match `gcloud alpha storage` and `gcloud beta storage` release tracks ([a68ad66](https://github.com/Dicklesworthstone/destructive_command_guard/commit/a68ad66)).
 - Refreshed the pattern-audit document after the storage.gcs keyword widening ([dc02ff4](https://github.com/Dicklesworthstone/destructive_command_guard/commit/dc02ff4)).
+- Hardened the real Codex E2E harness so relative `--dcg-binary` paths are canonicalized before hook configuration, and missing option values fail with a setup error instead of shifting later arguments ([cd1b612](https://github.com/Dicklesworthstone/destructive_command_guard/commit/cd1b612), [d11de4d](https://github.com/Dicklesworthstone/destructive_command_guard/commit/d11de4d)).
 
 ## [v0.4.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.6) -- 2026-05-01 [Release]
 

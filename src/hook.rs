@@ -664,7 +664,9 @@ pub(crate) fn print_colorful_warning_to(
         denial = denial.with_explanation(text);
     }
 
-    if audience == WarningAudience::HumanOperator && let Some(code) = allow_once_code {
+    if audience == WarningAudience::HumanOperator
+        && let Some(code) = allow_once_code
+    {
         denial = denial.with_allow_once_code(code);
     }
 
