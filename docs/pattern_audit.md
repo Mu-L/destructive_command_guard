@@ -615,8 +615,8 @@ Generated: 2026-04-30T22:58:33.693996
 | safe | `helm-template` | Found '(?=' | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+template(?=\s\|$)` |
 | safe | `helm-lint` | Found '(?=' | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+lint(?=\s\|$)` |
 | safe | `helm-diff` | Found '(?=' | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
-| destructive | `uninstall` | Found '!' | `helm\b.*?\b(?:uninstall\|delete)\b(?!.*--dry-run)` |
-| destructive | `rollback` | Found '!' | `helm\b.*?\brollback\b(?!.*--dry-run)` |
+| destructive | `uninstall` | Found '!' | `helm\b.*?\b(?:uninstall\|delete)\b(?!.*--dry-run(?:...` |
+| destructive | `rollback` | Found '!' | `helm\b.*?\brollback\b(?!.*--dry-run(?:=(?:true\|client...` |
 
 ## `src/packs/kubernetes/kubectl.rs`
 
@@ -641,6 +641,8 @@ Generated: 2026-04-30T22:58:33.693996
 |------|------|--------|---------------|
 | safe | `kustomize-build` | Found '!' | `kustomize\b(?:\s+--?\S+(?:\s+\S+)?)*\s+build\b(?!.*\\|)` |
 | safe | `kubectl-kustomize` | Found '!' | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+kustomize\b(?!.*\\|)` |
+| destructive | `kustomize-delete` | Found '!' | `kustomize\b.*?\bbuild\s+.*\\|\s*kubectl\b(?!.*--dry...` |
+| destructive | `kubectl-kustomize-delete` | Found '!' | `kubectl\b.*?\bkustomize\s+.*\\|\s*kubectl\b(?!.*--...` |
 | destructive | `kubectl-delete-k` | Found '!' | `kubectl\b.*?\bdelete\s+-k\b(?!.*--dry-run)` |
 
 ## `src/packs/loadbalancer/traefik.rs`

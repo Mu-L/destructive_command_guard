@@ -550,7 +550,13 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "kubernetes.kustomize",
-            HashSet::from(["kubectl-delete-k", "kubectl-kustomize", "kustomize-build"]),
+            HashSet::from([
+                "kubectl-delete-k",
+                "kubectl-kustomize",
+                "kubectl-kustomize-delete",
+                "kustomize-build",
+                "kustomize-delete",
+            ]),
         ),
         (
             "loadbalancer.traefik",

@@ -67,7 +67,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+repo(?=\s|$)"
         ),
         // dry-run flags
-        safe_pattern!("helm-dry-run", r"helm\b.*--dry-run"),
+        safe_pattern!(
+            "helm-dry-run",
+            r"helm\b.*--dry-run(?:=(?:true|client|server))?(?:\s|$)"
+        ),
         // template only generates manifests
         safe_pattern!(
             "helm-template",
@@ -91,7 +94,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // uninstall / delete
         destructive_pattern!(
             "uninstall",
-            r"helm\b.*?\b(?:uninstall|delete)\b(?!.*--dry-run)",
+            r"helm\b.*?\b(?:uninstall|delete)\b(?!.*--dry-run(?:=(?:true|client|server))?(?:\s|$))",
             "helm uninstall removes the release and all its resources. Use --dry-run first.",
             Critical,
             "helm uninstall deletes the release and ALL Kubernetes resources created by it:\n\n\
@@ -108,7 +111,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rollback without dry-run
         destructive_pattern!(
             "rollback",
-            r"helm\b.*?\brollback\b(?!.*--dry-run)",
+            r"helm\b.*?\brollback\b(?!.*--dry-run(?:=(?:true|client|server))?(?:\s|$))",
             "helm rollback reverts to a previous release. Use --dry-run to preview changes.",
             High,
             "helm rollback reverts the release to a previous revision. This can cause unexpected \
@@ -257,7 +260,31 @@ mod tests {
     fn helm_dry_run_overrides_destructive() {
         let pack = create_pack();
         assert_allows(&pack, "helm uninstall my-release --dry-run");
+        assert_allows(&pack, "helm uninstall my-release --dry-run=true");
         assert_allows(&pack, "helm rollback my-release 3 --dry-run");
+    }
+
+    #[test]
+    fn helm_false_or_none_dry_run_values_do_not_bypass() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "helm uninstall my-release --dry-run=false",
+            "uninstall",
+        );
+        assert_blocks(&pack, "helm delete my-release --dry-run=false", "uninstall");
+        assert_blocks(
+            &pack,
+            "helm rollback my-release 3 --dry-run=false",
+            "rollback",
+        );
+        assert_blocks(
+            &pack,
+            "helm uninstall my-release --dry-run=none",
+            "uninstall",
+        );
+        assert_no_safe_match(&pack, "helm uninstall my-release --dry-run=false");
+        assert_no_safe_match(&pack, "helm uninstall my-release --dry-run=none");
     }
 
     #[test]

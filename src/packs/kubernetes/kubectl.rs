@@ -156,7 +156,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // dry-run is safe
         safe_pattern!(
             "kubectl-dry-run",
-            r"kubectl\b.*--dry-run(?:=(?:client|server|none))?"
+            r"kubectl\b.*--dry-run(?:=(?:client|server))?(?:\s|$)"
         ),
         // diff is safe (shows what would change)
         safe_pattern!(
@@ -304,7 +304,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete deployment/statefulset/daemonset
         destructive_pattern!(
             "delete-workload",
-            r"kubectl\b.*?\bdelete\s+(?:deployment|statefulset|daemonset|replicaset)\b(?!.*--dry-run)",
+            r"kubectl\b.*?\bdelete\s+(?:deployment|statefulset|daemonset|replicaset)\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$))",
             "kubectl delete deployment/statefulset/daemonset removes the workload. Use --dry-run first.",
             High,
             "Deleting a workload terminates all its pods:\n\n\
@@ -321,7 +321,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete pvc (persistent volume claim)
         destructive_pattern!(
             "delete-pvc",
-            r"kubectl\b.*?\bdelete\s+(?:pvc|persistentvolumeclaim)\b(?!.*--dry-run)",
+            r"kubectl\b.*?\bdelete\s+(?:pvc|persistentvolumeclaim)\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$))",
             "kubectl delete pvc may permanently delete data if ReclaimPolicy is Delete.",
             Critical,
             "Deleting a PVC can cause permanent data loss depending on the PV's reclaimPolicy:\n\n\
@@ -339,7 +339,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete pv (persistent volume)
         destructive_pattern!(
             "delete-pv",
-            r"kubectl\b.*?\bdelete\s+(?:pv|persistentvolume)\b(?!.*--dry-run)",
+            r"kubectl\b.*?\bdelete\s+(?:pv|persistentvolume)\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$))",
             "kubectl delete pv may permanently delete the underlying storage.",
             Critical,
             "Deleting a PersistentVolume can permanently destroy the underlying storage:\n\n\
@@ -636,6 +636,24 @@ mod tests {
             "kubectl delete namespace production --dry-run=client",
         );
         assert_allows(&pack, "kubectl delete deployment web --dry-run=server");
+        assert_allows(&pack, "kubectl delete deployment web --dry-run");
+    }
+
+    #[test]
+    fn kubectl_dry_run_none_does_not_bypass_destructive_patterns() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "kubectl delete deployment web --dry-run=none",
+            "delete-workload",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "kubectl delete pvc data --dry-run=none",
+            "delete-pvc",
+        );
+        assert_blocks_with_pattern(&pack, "kubectl delete pv data --dry-run=none", "delete-pv");
+        assert_no_safe_match(&pack, "kubectl delete deployment web --dry-run=none");
     }
 
     #[test]

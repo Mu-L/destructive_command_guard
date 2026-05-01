@@ -35,7 +35,7 @@ These patterns match safe commands that are always allowed:
 | `kubectl-get` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+get(?=\s\|$)` |
 | `kubectl-describe` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+describe(?=\s\|$)` |
 | `kubectl-logs` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?=\s\|$)` |
-| `kubectl-dry-run` | `kubectl\b.*--dry-run(?:=(?:client\|server\|none))?` |
+| `kubectl-dry-run` | `kubectl\b.*--dry-run(?:=(?:client\|server))?(?:\s\|$)` |
 | `kubectl-diff` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
 | `kubectl-explain` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+explain(?=\s\|$)` |
 | `kubectl-top` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+top(?=\s\|$)` |
@@ -113,7 +113,7 @@ These patterns match safe commands that are always allowed:
 | `helm-get` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+get(?=\s\|$)` |
 | `helm-search` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+search(?=\s\|$)` |
 | `helm-repo` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+repo(?=\s\|$)` |
-| `helm-dry-run` | `helm\b.*--dry-run` |
+| `helm-dry-run` | `helm\b.*--dry-run(?:=(?:true\|client\|server))?(?:\s\|$)` |
 | `helm-template` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+template(?=\s\|$)` |
 | `helm-lint` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+lint(?=\s\|$)` |
 | `helm-diff` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
@@ -172,7 +172,7 @@ These patterns match safe commands that are always allowed:
 | `kustomize-build` | `kustomize\b(?:\s+--?\S+(?:\s+\S+)?)*\s+build\b(?!.*\\|)` |
 | `kubectl-kustomize` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+kustomize\b(?!.*\\|)` |
 | `kustomize-diff` | `kustomize\b.*?\bbuild\s+.*\\|\s*kubectl\b.*?\s+diff\b` |
-| `kustomize-dry-run` | `kustomize\b.*?\bbuild\s+.*\\|\s*kubectl\b.*--dry-run` |
+| `kustomize-dry-run` | `kustomize\b.*?\bbuild\s+.*\\|\s*kubectl\b.*--dry-run(?:=(?:client\|server))?(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

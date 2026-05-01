@@ -44,7 +44,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // kustomize with dry-run
         safe_pattern!(
             "kustomize-dry-run",
-            r"kustomize\b.*?\bbuild\s+.*\|\s*kubectl\b.*--dry-run"
+            r"kustomize\b.*?\bbuild\s+.*\|\s*kubectl\b.*--dry-run(?:=(?:client|server))?(?:\s|$)"
         ),
     ]
 }
@@ -54,7 +54,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // kustomize build | kubectl delete
         destructive_pattern!(
             "kustomize-delete",
-            r"kustomize\b.*?\bbuild\s+.*\|\s*kubectl\b.*?\bdelete",
+            r"kustomize\b.*?\bbuild\s+.*\|\s*kubectl\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$)).*?\bdelete",
             "kustomize build | kubectl delete removes all resources in the kustomization.",
             Critical,
             "Piping kustomize build to kubectl delete removes ALL resources defined in the \
@@ -71,7 +71,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // kubectl kustomize | kubectl delete
         destructive_pattern!(
             "kubectl-kustomize-delete",
-            r"kubectl\b.*?\bkustomize\s+.*\|\s*kubectl\b.*?\bdelete",
+            r"kubectl\b.*?\bkustomize\s+.*\|\s*kubectl\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$)).*?\bdelete",
             "kubectl kustomize | kubectl delete removes all resources in the kustomization.",
             Critical,
             "Piping kubectl kustomize to kubectl delete removes ALL resources defined in the \
@@ -88,7 +88,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // kubectl delete -k (kustomize flag)
         destructive_pattern!(
             "kubectl-delete-k",
-            r"kubectl\b.*?\bdelete\s+-k\b(?!.*--dry-run)",
+            r"kubectl\b.*?\bdelete\s+-k\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$))",
             "kubectl delete -k removes all resources defined in the kustomization. Use --dry-run first.",
             Critical,
             "kubectl delete -k removes all resources defined in a kustomization directory. \
@@ -168,7 +168,34 @@ mod tests {
             &pack,
             "kustomize build ./overlays/prod | kubectl apply --dry-run=client -f -",
         );
+        assert_allows(
+            &pack,
+            "kustomize build ./overlays/prod | kubectl delete --dry-run=client -f -",
+        );
+        assert_allows(
+            &pack,
+            "kubectl kustomize ./overlays/prod | kubectl delete --dry-run=server -f -",
+        );
         assert_allows(&pack, "kubectl delete -k ./prod --dry-run=client");
+    }
+
+    #[test]
+    fn kustomize_dry_run_none_does_not_bypass_delete() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "kustomize build ./overlays/prod | kubectl delete --dry-run=none -f -",
+            "kustomize",
+        );
+        assert_blocks(
+            &pack,
+            "kubectl delete -k ./prod --dry-run=none",
+            "delete -k",
+        );
+        assert_no_safe_match(
+            &pack,
+            "kustomize build ./overlays/prod | kubectl delete --dry-run=none -f -",
+        );
     }
 
     #[test]
