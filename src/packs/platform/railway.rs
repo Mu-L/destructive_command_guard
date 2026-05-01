@@ -392,7 +392,7 @@ mod tests {
                 "railway-database-variable-set",
             ),
             (
-                "railway variables set MONGOPASSWORD=redacted-value",
+                "railway variables set MONGO_URL=mongodb://example.invalid/app",
                 "railway-database-variable-set",
             ),
             (
