@@ -175,8 +175,12 @@ Commands containing these keywords are checked against this pack:
 - `serviceDelete`
 - `volumeDelete`
 - `volumeInstanceDelete`
+- `volumeInstanceBackupDelete`
+- `volumeInstanceBackupRestore`
+- `volumeInstanceBackupScheduleUpdate`
 - `volumeInstanceUpdate`
 - `variableDelete`
+- `variableUpsert`
 - `variableCollectionUpsert`
 - `deploymentRemove`
 - `deploymentStop`
@@ -217,6 +221,9 @@ These patterns match potentially destructive commands:
 | `railway-api-environment-delete` | Railway Public API environment deletion mutation detected. | critical |
 | `railway-api-service-delete` | Railway Public API service deletion mutation detected. | critical |
 | `railway-api-volume-delete` | Railway Public API volume deletion mutation detected. | critical |
+| `railway-api-volume-backup-restore` | Railway Public API volume backup restore mutation detected. | critical |
+| `railway-api-volume-backup-delete` | Railway Public API volume backup deletion mutation detected. | high |
+| `railway-api-volume-backup-schedule-update` | Railway Public API volume backup schedule update mutation detected. | high |
 | `railway-api-volume-detach` | Railway Public API volume detach mutation detected. | high |
 | `railway-api-variable-delete` | Railway Public API variable deletion mutation detected. | high |
 | `railway-api-database-variable-upsert` | Railway Public API upsert is changing a database connection variable. | high |
@@ -242,4 +249,3 @@ risk_acknowledged = true
 ```
 
 ---
-

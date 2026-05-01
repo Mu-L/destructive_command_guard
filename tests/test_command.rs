@@ -291,6 +291,36 @@ fn test_with_packs_checks_railway_api_curl_payloads() {
 }
 
 #[test]
+fn test_with_packs_checks_railway_api_backup_restore_payloads() {
+    let cmd = r#"curl https://backboard.railway.app/graphql/v2 -d '{"query":"mutation { volumeInstanceBackupRestore(input:{volumeInstanceId:\"v\", backupId:\"b\"}) }"}'"#;
+
+    let output = run_dcg_isolated(
+        &[
+            "test",
+            "--format",
+            "json",
+            "--with-packs",
+            "platform.railway",
+            cmd,
+        ],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Railway API volume backup restore should be blocked\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "platform.railway");
+    assert_eq!(json["pattern_name"], "railway-api-volume-backup-restore");
+}
+
+#[test]
 fn test_with_packs_checks_railway_api_token_header_payloads() {
     let cmd = r#"curl https://api.example.com/graphql -H "Authorization: Bearer $RAILWAY_API_TOKEN" --data-binary '{"query":"mutation { projectDelete(id:\"p\") }"}'"#;
 

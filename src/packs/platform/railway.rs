@@ -93,6 +93,9 @@ pub fn create_pack() -> Pack {
             "serviceDelete",
             "volumeDelete",
             "volumeInstanceDelete",
+            "volumeInstanceBackupDelete",
+            "volumeInstanceBackupRestore",
+            "volumeInstanceBackupScheduleUpdate",
             "volumeInstanceUpdate",
             "variableDelete",
             "variableUpsert",
@@ -264,6 +267,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             VOLUME_SUGGESTIONS
         ),
         destructive_pattern!(
+            "railway-api-volume-backup-restore",
+            r"(?i)(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN)).*volumeInstanceBackupRestore|volumeInstanceBackupRestore.*(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN))",
+            "Railway Public API volume backup restore mutation detected.",
+            Critical,
+            "Restoring a Railway volume backup can replace current persistent data and roll back a production database.",
+            VOLUME_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "railway-api-volume-backup-delete",
+            r"(?i)(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN)).*volumeInstanceBackupDelete|volumeInstanceBackupDelete.*(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN))",
+            "Railway Public API volume backup deletion mutation detected.",
+            High,
+            "Deleting Railway volume backups removes recovery points for persistent database storage.",
+            VOLUME_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "railway-api-volume-backup-schedule-update",
+            r"(?i)(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN)).*volumeInstanceBackupScheduleUpdate|volumeInstanceBackupScheduleUpdate.*(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN))",
+            "Railway Public API volume backup schedule update mutation detected.",
+            High,
+            "Changing Railway volume backup schedules can disable or weaken database recovery coverage.",
+            VOLUME_SUGGESTIONS
+        ),
+        destructive_pattern!(
             "railway-api-volume-detach",
             r#"(?i)(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN)).*volumeInstanceUpdate.*["']?serviceId["']?\s*:\s*null|volumeInstanceUpdate.*["']?serviceId["']?\s*:\s*null.*(?:backboard\.railway\.(?:app|com)|railway\.(?:app|com)/graphql|RAILWAY_API_(?:URL|TOKEN))"#,
             "Railway Public API volume detach mutation detected.",
@@ -311,6 +338,7 @@ mod tests {
         assert_eq!(pack.name, "Railway Platform");
         assert!(pack.keywords.contains(&"railway"));
         assert!(pack.keywords.contains(&"projectScheduleDelete"));
+        assert!(pack.keywords.contains(&"volumeInstanceBackupRestore"));
 
         assert_patterns_compile(&pack);
         assert_all_patterns_have_reasons(&pack);
@@ -442,6 +470,18 @@ mod tests {
             (
                 r#"curl https://backboard.railway.app/graphql/v2 -d '{"query":"mutation { volumeDelete(volumeId:\"v\") }"}'"#,
                 "railway-api-volume-delete",
+            ),
+            (
+                r#"curl https://backboard.railway.app/graphql/v2 -d '{"query":"mutation { volumeInstanceBackupRestore(input:{volumeInstanceId:\"v\", backupId:\"b\"}) }"}'"#,
+                "railway-api-volume-backup-restore",
+            ),
+            (
+                r#"curl "$RAILWAY_API_URL" -d '{"query":"mutation { volumeInstanceBackupDelete(input:{volumeInstanceId:\"v\", backupId:\"b\"}) }"}'"#,
+                "railway-api-volume-backup-delete",
+            ),
+            (
+                r#"curl https://api.example.com/graphql -H "Authorization: Bearer $RAILWAY_API_TOKEN" -d '{"query":"mutation { volumeInstanceBackupScheduleUpdate(kinds:[], volumeInstanceId:\"v\") }"}'"#,
+                "railway-api-volume-backup-schedule-update",
             ),
             (
                 r#"curl https://backboard.railway.app/graphql/v2 -d '{"query":"mutation { volumeInstanceUpdate(input:{serviceId:null, volumeId:\"v\"}) }"}'"#,
