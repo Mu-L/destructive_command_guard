@@ -17,11 +17,10 @@ extract_install_functions() {
     local tmp_functions
     tmp_functions="$(mktemp)"
 
-    # Create a modified version of install.sh that can be sourced
-    # Functions are defined throughout the file, including in the middle
-    # We add a return statement just before the auto-configuration execution (line ~1017)
+    # Create a modified version of install.sh that can be sourced.
+    # Functions are defined throughout the file, including after the download
+    # phase. Strip top-level execution blocks while preserving definitions.
     {
-        # Read install.sh and insert a return before actual execution
         sed '
             # Skip shebang
             1d
@@ -29,8 +28,12 @@ extract_install_functions() {
             s/^set -euo pipefail/set -e/
             # Disable exit on errors for sourcing
             s/^umask 022/umask 022; set +e/
-            # Return before actual execution starts (after all function definitions)
-            # The "Run Auto-Configuration" section starts actual execution
+            # Drop the top-level install/download execution block. Later hook
+            # configuration functions still need to be sourced.
+            /^set_artifact_url$/,/^# Claude Code \/ Gemini CLI \/ Cursor Auto-Configuration$/ {
+                /^# Claude Code \/ Gemini CLI \/ Cursor Auto-Configuration$/!d
+            }
+            # Return before the final auto-configuration execution block.
             /^# Run Auto-Configuration$/i\
 return 0 2>/dev/null || true
         ' "$INSTALL_SCRIPT"
