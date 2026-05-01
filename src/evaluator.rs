@@ -2264,7 +2264,13 @@ fn command_contains_curl_invocation(command: &str) -> bool {
         .split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')'))
         .map(|word| word.trim_matches(['"', '\'']))
         .filter_map(|word| word.rsplit(['/', '\\']).next())
-        .map(|name| name.strip_suffix(".exe").unwrap_or(name))
+        .map(|name| {
+            if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+                &name[..name.len() - 4]
+            } else {
+                name
+            }
+        })
         .any(|name| name.eq_ignore_ascii_case("curl"))
 }
 
@@ -3530,23 +3536,30 @@ mod tests {
 
     #[test]
     fn railway_api_payload_recheck_detects_windows_curl_exe() {
-        let result = evaluate_with_pack_ids(
-            r#"C:\Windows\System32\curl.exe https://backboard.railway.app/graphql/v2 --data-binary '{"query":"mutation { projectDelete(id:\"p\") }"}'"#,
-            &["platform.railway"],
-        );
+        for curl_binary in [
+            r"C:\Windows\System32\curl.exe",
+            r"C:\Windows\System32\CURL.EXE",
+        ] {
+            let result = evaluate_with_pack_ids(
+                &format!(
+                    r#"{curl_binary} https://backboard.railway.app/graphql/v2 --data-binary '{{"query":"mutation {{ projectDelete(id:\"p\") }}"}}'"#
+                ),
+                &["platform.railway"],
+            );
 
-        assert!(
-            result.is_denied(),
-            "Railway API mutation through curl.exe must still be blocked"
-        );
-        let info = result
-            .pattern_info
-            .expect("denial should include pattern info");
-        assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
-        assert_eq!(
-            info.pattern_name.as_deref(),
-            Some("railway-api-project-delete")
-        );
+            assert!(
+                result.is_denied(),
+                "Railway API mutation through {curl_binary} must still be blocked"
+            );
+            let info = result
+                .pattern_info
+                .expect("denial should include pattern info");
+            assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
+            assert_eq!(
+                info.pattern_name.as_deref(),
+                Some("railway-api-project-delete")
+            );
+        }
     }
 
     #[test]
