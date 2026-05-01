@@ -332,7 +332,7 @@ fn try_parse_hook_json(line: &str, max_command_bytes: Option<usize>) -> Option<P
             }
         };
 
-    if !crate::hook::is_supported_shell_tool(hook_input.tool_name.as_deref()) {
+    if !crate::hook::is_shell_hook_candidate(&hook_input) {
         return Some(ParsedLine::Ignore {
             reason: "non-shell tool",
         });
@@ -1195,6 +1195,20 @@ mod tests {
     #[test]
     fn detect_hook_json_copilot_tool_args_string() {
         let line = r#"{"event":"pre-tool-use","toolName":"run_shell_command","toolArgs":"{\"command\":\"git status\"}"}"#;
+        let result = parse_line(line, None);
+        assert!(
+            matches!(&result, ParsedLine::Command { .. }),
+            "expected Command, got {result:?}"
+        );
+        if let ParsedLine::Command { command, format } = result {
+            assert_eq!(command, "git status");
+            assert_eq!(format, SimulateInputFormat::HookJson);
+        }
+    }
+
+    #[test]
+    fn detect_hook_json_copilot_tool_args_without_tool_name() {
+        let line = r#"{"event":"pre-tool-use","toolArgs":"{\"command\":\"git status\"}"}"#;
         let result = parse_line(line, None);
         assert!(
             matches!(&result, ParsedLine::Command { .. }),

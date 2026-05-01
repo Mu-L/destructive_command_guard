@@ -451,6 +451,23 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
     )
 }
 
+pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
+    if is_supported_shell_tool(input.tool_name.as_deref()) {
+        return true;
+    }
+
+    input.tool_name.is_none()
+        && matches!(detect_protocol(input), HookProtocol::Copilot)
+        && (input.tool_input.is_some() || input.tool_args.is_some())
+}
+
+fn extract_command_from_tool_input(tool_input: &ToolInput) -> Option<String> {
+    match tool_input.command.as_ref() {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
 fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<String> {
     match tool_args {
         serde_json::Value::Object(map) => map.get("command").and_then(|v| match v {
@@ -473,18 +490,18 @@ fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<Strin
 /// Extract command and protocol from hook input.
 #[must_use]
 pub fn extract_command_with_protocol(input: &HookInput) -> Option<(String, HookProtocol)> {
-    // Only process shell-command invocations for supported clients.
-    if !is_supported_shell_tool(input.tool_name.as_deref()) {
+    let protocol = detect_protocol(input);
+
+    // Only process shell-command invocations for supported clients. Copilot
+    // can omit toolName and put the shell command directly in toolArgs, so
+    // treat that distinctive envelope as a shell candidate too.
+    if !is_shell_hook_candidate(input) {
         return None;
     }
 
-    let protocol = detect_protocol(input);
-
     if let Some(tool_input) = input.tool_input.as_ref() {
-        if let Some(serde_json::Value::String(s)) = tool_input.command.as_ref() {
-            if !s.is_empty() {
-                return Some((s.clone(), protocol));
-            }
+        if let Some(command) = extract_command_from_tool_input(tool_input) {
+            return Some((command, protocol));
         }
     }
 
@@ -1401,6 +1418,25 @@ mod tests {
             Some("rm -rf /tmp/build".to_string())
         );
         assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_parse_copilot_tool_args_without_tool_name() {
+        let json = r#"{"event":"pre-tool-use","toolArgs":"{\"command\":\"git reset --hard\"}"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+        assert_eq!(
+            extract_command(&input),
+            Some("git reset --hard".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_copilot_tool_input_without_tool_name() {
+        let json = r#"{"event":"pre-tool-use","toolInput":{"command":"git status"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+        assert_eq!(extract_command(&input), Some("git status".to_string()));
     }
 
     #[test]

@@ -297,6 +297,30 @@ fn smoke_claude_destructive_command_blocked() {
     );
 }
 
+#[test]
+fn copilot_tool_args_without_tool_name_blocks_destructive_command() {
+    let payload = serde_json::json!({
+        "event": "pre-tool-use",
+        "toolArgs": serde_json::json!({ "command": "git reset --hard" }).to_string(),
+    })
+    .to_string();
+
+    let outcome = run_hook_raw(payload.as_bytes(), &[]);
+    assert_eq!(
+        outcome.exit_code, 0,
+        "Copilot deny should exit 0 with JSON on stdout\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout.is_empty(),
+        "Copilot deny must produce stdout JSON\n{outcome}"
+    );
+
+    let json = outcome.stdout_json();
+    assert_eq!(json["permissionDecision"], "deny", "{outcome}");
+    assert_eq!(json["ruleId"], "core.git:reset-hard", "{outcome}");
+    assert_eq!(json["continue"], false, "{outcome}");
+}
+
 // ---------------------------------------------------------------------------
 // P2.2 — Codex deny path: exit=2, 0 bytes stdout, non-empty stderr
 // ---------------------------------------------------------------------------
