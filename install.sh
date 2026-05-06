@@ -168,6 +168,7 @@ AIDER_VERSION=""
 CONTINUE_VERSION=""
 CURSOR_VERSION=""
 COPILOT_VERSION=""
+HERMES_VERSION=""
 
 print_agent_scan_notice() {
   [ "$QUIET" -eq 1 ] && return 0
@@ -271,6 +272,13 @@ detect_agents() {
     DETECTED_AGENTS+=("cursor-ide")
     CURSOR_VERSION=$(try_version cursor)
   fi
+
+  # Hermes Agent (NousResearch) — config dir at ~/.hermes, optional `hermes`
+  # CLI on PATH.
+  if [[ -d "$HOME/.hermes" ]] || command -v hermes &>/dev/null; then
+    DETECTED_AGENTS+=("hermes")
+    HERMES_VERSION=$(try_version hermes)
+  fi
 }
 
 print_detected_agents() {
@@ -323,6 +331,11 @@ print_detected_agents() {
           [[ -n "$CURSOR_VERSION" ]] && ver_info=" (${CURSOR_VERSION})"
           gum style --foreground 42 "  ✓ Cursor IDE${ver_info}"
           ;;
+        hermes)
+          local ver_info=""
+          [[ -n "$HERMES_VERSION" ]] && ver_info=" (${HERMES_VERSION})"
+          gum style --foreground 42 "  ✓ Hermes Agent${ver_info}"
+          ;;
       esac
     done
     echo ""
@@ -365,6 +378,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$CURSOR_VERSION" ]] && ver_info=" (${CURSOR_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Cursor IDE${ver_info}"
+          ;;
+        hermes)
+          local ver_info=""
+          [[ -n "$HERMES_VERSION" ]] && ver_info=" (${HERMES_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Hermes Agent${ver_info}"
           ;;
       esac
     done
@@ -1101,6 +1119,7 @@ CURSOR_SETTINGS_LINUX="$HOME/.config/Cursor/User/settings.json"
 CURSOR_HOOKS_JSON="$HOME/.cursor/hooks.json"
 CURSOR_HOOK_DIR="$HOME/.cursor/hooks"
 CURSOR_HOOK_SCRIPT="$CURSOR_HOOK_DIR/dcg-pre-shell.py"
+HERMES_CONFIG="$HOME/.hermes/config.yaml"
 AUTO_CONFIGURED=0
 
 # Detailed tracking for what was configured
@@ -1116,11 +1135,14 @@ GEMINI_FAILURE_REASON=""
 CURSOR_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"|"conflict"
 CURSOR_FAILURE_REASON=""
 COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"no_repo"|"failed"
+HERMES_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
+HERMES_FAILURE_REASON=""
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
 AIDER_BACKUP=""
 CURSOR_BACKUP=""
 COPILOT_BACKUP=""
+HERMES_BACKUP=""
 COPILOT_HOOK_FILE=""
 COPILOT_FAILURE_REASON=""
 
@@ -2565,6 +2587,276 @@ EOFSET
   fi
 }
 
+configure_hermes() {
+  # Hermes Agent (NousResearch — https://github.com/NousResearch/hermes-agent)
+  # supports shell hooks via ~/.hermes/config.yaml. Wire shape:
+  #   hooks:
+  #     pre_tool_call:
+  #       - matcher: "terminal"
+  #         command: "/path/to/dcg"
+  #         timeout: 30
+  #
+  # The hook script reads JSON on stdin and writes JSON on stdout; the
+  # block decision lives in the JSON payload (`{"decision":"block",...}`),
+  # NOT in the exit code — Hermes documents that "non-zero exit codes,
+  # malformed JSON, and timeouts log a warning but never abort the agent
+  # loop". dcg handles this by emitting `HookProtocol::Hermes` JSON when
+  # it sees `tool_name="terminal"` or `hook_event_name="pre_tool_call"`
+  # on stdin; no wrapper script is required.
+  #
+  # The matcher is a regex per the docs; we anchor to "terminal" exactly.
+  #
+  # We also need `hooks_auto_accept: true` for the hook to fire in
+  # non-TTY contexts (gateway, cron) — the docs are explicit that
+  # without one of `--accept-hooks` / `HERMES_ACCEPT_HOOKS=1` /
+  # `hooks_auto_accept: true`, the hook "silently remains unregistered"
+  # in non-interactive runs. We only set it if the user has not already
+  # set it (preserving any existing `false`).
+  #
+  # See: https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md
+
+  local settings_file="$HERMES_CONFIG"
+  HERMES_FAILURE_REASON=""
+  local settings_dir
+  settings_dir=$(dirname "$settings_file")
+
+  # Detect Hermes installation: config dir or `hermes` on PATH.
+  local hermes_installed=0
+  if [ -d "$settings_dir" ] || command -v hermes >/dev/null 2>&1; then
+    hermes_installed=1
+  fi
+
+  if [ "$hermes_installed" -eq 0 ]; then
+    HERMES_STATUS="skipped"
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    HERMES_STATUS="failed"
+    HERMES_FAILURE_REASON="python3 required to safely merge YAML config"
+    return 0
+  fi
+
+  # Verify PyYAML is available; the YAML merge is too risky to fake.
+  if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    HERMES_STATUS="failed"
+    HERMES_FAILURE_REASON="python3 PyYAML required to safely merge ~/.hermes/config.yaml"
+    return 0
+  fi
+
+  if [ ! -d "$settings_dir" ]; then
+    mkdir -p "$settings_dir"
+  fi
+
+  if [ -f "$settings_file" ]; then
+    # First pass: detect whether the exact current dcg hook is the only
+    # dcg entry in pre_tool_call (so reinstall is a no-op).
+    local hermes_hook_state
+    hermes_hook_state=$(python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+import os
+import shlex
+import sys
+import yaml
+
+cfg_file = sys.argv[1]
+dcg_path = sys.argv[2]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(cfg_file, "r") as f:
+        cfg = yaml.safe_load(f)
+except (IOError, yaml.YAMLError):
+    print("invalid")
+    raise SystemExit(0)
+
+if cfg is None:
+    cfg = {}
+if not isinstance(cfg, dict):
+    print("invalid")
+    raise SystemExit(0)
+
+hooks = cfg.get("hooks")
+if hooks is None:
+    print("merge")
+    raise SystemExit(0)
+if not isinstance(hooks, dict):
+    print("invalid")
+    raise SystemExit(0)
+
+pre_tool_call = hooks.get("pre_tool_call")
+if pre_tool_call is None:
+    print("merge")
+    raise SystemExit(0)
+if not isinstance(pre_tool_call, list):
+    print("invalid")
+    raise SystemExit(0)
+
+dcg_entries = []
+first_command = None
+for i, entry in enumerate(pre_tool_call):
+    if not isinstance(entry, dict):
+        continue
+    cmd = entry.get("command")
+    if i == 0:
+        first_command = cmd
+    if is_dcg_command(cmd):
+        dcg_entries.append(cmd)
+
+# Idempotent: exactly one dcg entry, it's our current path, and it's first.
+if dcg_entries == [dcg_path] and first_command == dcg_path:
+    print("already")
+else:
+    print("merge")
+PYEOF
+)
+    if [ "$hermes_hook_state" = "invalid" ]; then
+      HERMES_STATUS="failed"
+      HERMES_FAILURE_REASON="existing config.yaml is invalid or has malformed hooks; left unchanged"
+      warn "Hermes config.yaml is invalid or has malformed hooks; leaving it unchanged: $settings_file"
+      return 0
+    fi
+    if [ "$hermes_hook_state" = "already" ]; then
+      HERMES_STATUS="already"
+      AUTO_CONFIGURED=1
+      return 0
+    fi
+
+    HERMES_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$settings_file" "$HERMES_BACKUP"
+
+    if python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+import os
+import shlex
+import sys
+import yaml
+
+cfg_file = sys.argv[1]
+dcg_path = sys.argv[2]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(cfg_file, "r") as f:
+        cfg = yaml.safe_load(f)
+except (IOError, yaml.YAMLError) as exc:
+    print(f"invalid Hermes config.yaml: {cfg_file}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if cfg is None:
+    cfg = {}
+if not isinstance(cfg, dict):
+    print(f"Hermes config.yaml must contain a YAML mapping: {cfg_file}", file=sys.stderr)
+    raise SystemExit(1)
+
+# Preserve any pre-existing top-level keys verbatim.
+hooks = cfg.get("hooks")
+if hooks is None:
+    cfg["hooks"] = {}
+    hooks = cfg["hooks"]
+elif not isinstance(hooks, dict):
+    print(f"Hermes config.yaml `hooks` must be a mapping: {cfg_file}", file=sys.stderr)
+    raise SystemExit(1)
+
+pre_tool_call = hooks.get("pre_tool_call")
+if pre_tool_call is None:
+    hooks["pre_tool_call"] = []
+    pre_tool_call = hooks["pre_tool_call"]
+elif not isinstance(pre_tool_call, list):
+    print(f"Hermes config.yaml `pre_tool_call` must be a list: {cfg_file}", file=sys.stderr)
+    raise SystemExit(1)
+
+# Drop any pre-existing dcg entries (stale paths, duplicates).
+filtered = []
+for entry in pre_tool_call:
+    if isinstance(entry, dict) and is_dcg_command(entry.get("command")):
+        continue
+    filtered.append(entry)
+
+# Insert exactly one dcg entry at the front; matcher anchors to the
+# documented Hermes shell tool name. timeout=30s is well under the
+# documented 300s ceiling and matches our Gemini default scaling.
+dcg_entry = {
+    "matcher": "terminal",
+    "command": dcg_path,
+    "timeout": 30,
+}
+filtered.insert(0, dcg_entry)
+hooks["pre_tool_call"] = filtered
+
+# Set hooks_auto_accept ONLY if the user has not specified it. Hermes
+# documents that without one of (--accept-hooks / HERMES_ACCEPT_HOOKS=1 /
+# hooks_auto_accept: true), shell hooks "silently remain unregistered"
+# in non-TTY contexts. Without this dcg would fail open in CI/cron.
+if "hooks_auto_accept" not in cfg:
+    cfg["hooks_auto_accept"] = True
+
+with open(cfg_file, "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+PYEOF
+    then
+      HERMES_STATUS="merged"
+      AUTO_CONFIGURED=1
+    else
+      mv "$HERMES_BACKUP" "$settings_file" 2>/dev/null || true
+      HERMES_STATUS="failed"
+      HERMES_FAILURE_REASON="merge failed; restored backup"
+      HERMES_BACKUP=""
+      return 0
+    fi
+  else
+    # Brand-new config.yaml. Write a minimal, well-commented config.
+    cat > "$settings_file" <<EOFSET
+# Hermes Agent configuration
+# Created by dcg installer (https://github.com/Dicklesworthstone/destructive_command_guard)
+#
+# pre_tool_call hooks fire before any tool invocation. dcg blocks
+# destructive shell commands by emitting {"decision":"block",...} on stdout.
+# Hermes documents that exit codes are advisory — the JSON decision is what
+# enforces the block.
+#
+# hooks_auto_accept is required so the hook actually registers in non-TTY
+# (gateway/cron) Hermes runs. Override per-command consent with
+# \`hermes hooks revoke\` if needed.
+
+hooks:
+  pre_tool_call:
+    - matcher: "terminal"
+      command: "$DEST/dcg"
+      timeout: 30
+
+hooks_auto_accept: true
+EOFSET
+    HERMES_STATUS="created"
+    AUTO_CONFIGURED=1
+  fi
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Run Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2635,6 +2927,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure Cursor IDE (if installed)
   configure_cursor
+
+  # Configure Hermes Agent (if installed)
+  configure_hermes
 else
   info "Skipping agent configuration (--no-configure)"
 fi
@@ -2839,6 +3134,29 @@ case "$CURSOR_STATUS" in
       summary_lines+=("Cursor IDE:  Configuration failed ($CURSOR_FAILURE_REASON)")
     else
       summary_lines+=("Cursor IDE:  Configuration failed")
+    fi
+    ;;
+esac
+
+case "$HERMES_STATUS" in
+  created)
+    summary_lines+=("Hermes:      Created $HERMES_CONFIG with pre_tool_call hook")
+    ;;
+  merged)
+    summary_lines+=("Hermes:      Added pre_tool_call hook to existing $HERMES_CONFIG")
+    [ -n "$HERMES_BACKUP" ] && summary_lines+=("             Backup: $HERMES_BACKUP")
+    ;;
+  already)
+    summary_lines+=("Hermes:      Already configured (no changes)")
+    ;;
+  skipped|"")
+    summary_lines+=("Hermes:      Not installed (skipped)")
+    ;;
+  failed)
+    if [ -n "$HERMES_FAILURE_REASON" ]; then
+      summary_lines+=("Hermes:      Configuration failed ($HERMES_FAILURE_REASON)")
+    else
+      summary_lines+=("Hermes:      Configuration failed")
     fi
     ;;
 esac

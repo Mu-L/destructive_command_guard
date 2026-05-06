@@ -1,8 +1,8 @@
 //! Hook protocol handling.
 //!
 //! This module handles JSON input/output for supported hook protocols
-//! (Claude Code, Codex CLI, Copilot, and Gemini). It parses incoming hook
-//! requests and formats denial responses.
+//! (Claude Code, Codex CLI, Copilot, Gemini, and Hermes Agent). It parses
+//! incoming hook requests and formats denial responses.
 
 use crate::evaluator::MatchSpan;
 use crate::highlight::HighlightSpan;
@@ -222,6 +222,68 @@ pub struct GeminiHookOutput<'a> {
     pub remediation: Option<Remediation>,
 }
 
+/// Hermes Agent denial output for shell `pre_tool_call` hooks.
+///
+/// Hermes documents two block-decision wire shapes — `{"decision": "block",
+/// "reason": ...}` and `{"action": "block", "message": ...}` — and accepts
+/// either. We emit the documented primary form (`decision` + `reason`) and
+/// also include the alternate keys (`action` + `message`) for compatibility
+/// with both codepaths. Hermes also explicitly notes that "non-zero exit
+/// codes... never crash the agent", so blocking MUST come from the JSON
+/// payload rather than the exit code.
+///
+/// Extra fields beyond `decision`/`action`/`reason`/`message` are tolerated
+/// by Hermes' parser (no `deny_unknown_fields`), so we include the same
+/// `ruleId` / `packId` / `severity` / `remediation` ergonomics as the
+/// Claude / Gemini outputs.
+///
+/// See: <https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md>
+#[derive(Debug, Serialize)]
+pub struct HermesHookOutput<'a> {
+    /// Primary block decision keyword (Hermes accepts `"block"` or, for
+    /// non-block events, anything truthy/falsy depending on event).
+    pub decision: &'static str,
+
+    /// Why the action was denied (paired with `decision`).
+    pub reason: Cow<'a, str>,
+
+    /// Alternate block-decision key documented by Hermes. We emit both forms
+    /// so future Hermes versions that prefer one over the other still see a
+    /// valid block.
+    pub action: &'static str,
+
+    /// Alternate human-readable message (paired with `action`).
+    pub message: Cow<'a, str>,
+
+    /// Short allow-once code (if a pending exception was recorded).
+    #[serde(rename = "allowOnceCode", skip_serializing_if = "Option::is_none")]
+    pub allow_once_code: Option<String>,
+
+    /// Full hash for allow-once disambiguation (if available).
+    #[serde(rename = "allowOnceFullHash", skip_serializing_if = "Option::is_none")]
+    pub allow_once_full_hash: Option<String>,
+
+    /// Stable rule identifier (e.g., "core.git:reset-hard").
+    #[serde(rename = "ruleId", skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+
+    /// Pack identifier that matched (e.g., "core.git").
+    #[serde(rename = "packId", skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+
+    /// Severity level of the matched pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<crate::packs::Severity>,
+
+    /// Confidence score for this match (0.0-1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+
+    /// Remediation suggestions for the blocked command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<Remediation>,
+}
+
 /// Hook protocol variant for response formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookProtocol {
@@ -241,6 +303,16 @@ pub enum HookProtocol {
     /// stderr reason" alternative path: dcg writes its colored message
     /// to stderr (existing behavior) and the process exits with code 2.
     Codex,
+    /// Hermes Agent (NousResearch) protocol. Wire shape: stdin carries
+    /// snake_case `hook_event_name: "pre_tool_call"`, `tool_name: "terminal"`,
+    /// `tool_input.command`. Block decision MUST be expressed via stdout JSON
+    /// `{"decision": "block", "reason": ...}` (or `{"action": "block",
+    /// "message": ...}`) — Hermes explicitly documents that non-zero exit
+    /// codes "log a warning but never abort the agent loop". Hermes shares
+    /// stdin envelope fields (`session_id`, `cwd`) with Claude/Gemini, so we
+    /// disambiguate via the lowercase event name `"pre_tool_call"` and the
+    /// distinctive `"terminal"` tool name.
+    Hermes,
 }
 
 /// Allow-once metadata for denial output.
@@ -350,6 +422,28 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .unwrap_or_default();
     let hook_event_name = input.hook_event_name.as_deref().unwrap_or_default();
 
+    // --- Hermes Agent indicators (checked first) ---
+    // Hermes uses two distinctive markers:
+    //   - hook_event_name="pre_tool_call" (snake_case; Claude uses PascalCase
+    //     "PreToolUse", Codex uses the same PascalCase form, Gemini uses
+    //     "BeforeTool", Copilot uses "pre-tool-use" via the `event` field).
+    //   - tool_name="terminal" (none of the other agents use this name).
+    // Either signal alone is a strong Hermes indicator. We check Hermes
+    // before Copilot because Copilot's `event`/`tool_args` markers can
+    // co-occur with arbitrary tool names — but if we see a `terminal` tool
+    // or `pre_tool_call` event without those Copilot markers, it's Hermes.
+    let is_hermes_event = hook_event_name == "pre_tool_call";
+    let is_hermes_tool = tool_name == "terminal";
+    if is_hermes_event || is_hermes_tool {
+        // Disambiguate: if Copilot's distinctive `event` (which is hyphenated
+        // "pre-tool-use", not snake_case "pre_tool_call") or `tool_args` is
+        // also present, prefer Copilot. But neither Hermes signal collides
+        // with Copilot's signals, so this is just a defensive check.
+        if input.event.is_none() && input.tool_args.is_none() {
+            return HookProtocol::Hermes;
+        }
+    }
+
     // --- Copilot indicators (checked first) ---
     // Copilot sends a distinctive `event` field (e.g. "pre-tool-use") that
     // neither Claude Code nor Gemini use. The `tool_args` field is also
@@ -456,6 +550,10 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             | "pwsh"
             | "run_shell_command"
             | "run-shell-command"
+            // Hermes Agent shell tool. Distinct from Cursor's "terminal"
+            // wrapper script which translates upstream to "Bash" before
+            // invoking dcg, so the only path here is genuine Hermes input.
+            | "terminal"
     )
 }
 
@@ -877,9 +975,10 @@ pub fn write_denial_to(
     let allow_once_code = allow_once.map(|info| info.code.as_str());
     let warning_audience = match protocol {
         HookProtocol::Codex => WarningAudience::CodexModel,
-        HookProtocol::ClaudeCompatible | HookProtocol::Copilot | HookProtocol::Gemini => {
-            WarningAudience::HumanOperator
-        }
+        HookProtocol::ClaudeCompatible
+        | HookProtocol::Copilot
+        | HookProtocol::Gemini
+        | HookProtocol::Hermes => WarningAudience::HumanOperator,
     };
 
     print_colorful_warning_to(
@@ -956,6 +1055,31 @@ pub fn write_denial_to(
                 decision: "deny",
                 reason: Cow::Owned(message),
                 system_message: Some(Cow::Owned(format!("BLOCKED by dcg: {reason}"))),
+                allow_once_code: allow_once.map(|info| info.code.clone()),
+                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity,
+                confidence,
+                remediation,
+            };
+
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Hermes => {
+            // Hermes uses the keyword "block" (not "deny") and accepts both
+            // {"decision":"block","reason":...} and {"action":"block",
+            // "message":...}. We emit both pairs so either Hermes codepath
+            // sees a valid block, plus the dcg-specific ergonomics fields
+            // (Hermes' parser does NOT use `deny_unknown_fields`, so the
+            // extras pass through unmolested for any tooling that wants
+            // them).
+            let output = HermesHookOutput {
+                decision: "block",
+                reason: Cow::Owned(message.clone()),
+                action: "block",
+                message: Cow::Owned(message),
                 allow_once_code: allow_once.map(|info| info.code.clone()),
                 allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
                 rule_id,
@@ -1146,6 +1270,25 @@ pub(crate) fn write_warning_to(
         }
         HookProtocol::Codex => {
             // Codex: stderr warning already written above; no stdout JSON.
+        }
+        HookProtocol::Hermes => {
+            // Hermes hooks support a "block" decision but no documented
+            // "ask" or "warn" decision. Surface dcg warnings to the user via
+            // the documented `context` field (which `pre_llm_call` consumes
+            // verbatim) AND keep the run going. For pre_tool_call, an empty
+            // {} response means "no opinion, proceed normally", so we emit
+            // {"context": "<warn message>"} which is structurally valid in
+            // both events while preserving the warning text for any tooling
+            // that surfaces context fields.
+            #[derive(Serialize)]
+            struct HermesWarningOutput<'a> {
+                context: Cow<'a, str>,
+            }
+            let output = HermesWarningOutput {
+                context: Cow::Owned(warn_reason),
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
         }
     }
 }
@@ -1628,6 +1771,205 @@ mod tests {
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["decision"], "allow");
         assert!(json["reason"].as_str().unwrap().starts_with("DCG warn:"));
+    }
+
+    // =========================================================================
+    // Hermes Agent (NousResearch) protocol tests — issue #110.
+    // =========================================================================
+
+    #[test]
+    fn test_parse_hermes_pre_tool_call_input() {
+        // Exact wire shape documented at
+        // https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md
+        let json = r#"{
+            "hook_event_name":"pre_tool_call",
+            "tool_name":"terminal",
+            "tool_input":{"command":"rm -rf /"},
+            "session_id":"sess_abc123",
+            "cwd":"/home/user/project",
+            "extra":{"task_id":"task-1","tool_call_id":"call-1"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(extract_command(&input), Some("rm -rf /".to_string()));
+        assert_eq!(detect_protocol(&input), HookProtocol::Hermes);
+    }
+
+    #[test]
+    fn test_hermes_detected_via_event_alone() {
+        // pre_tool_call is the unique snake_case event name; even with a
+        // non-Hermes-shaped tool name we still classify Hermes since no
+        // other supported agent uses this event marker.
+        let json = r#"{
+            "hook_event_name":"pre_tool_call",
+            "tool_name":"bash",
+            "tool_input":{"command":"git status"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Hermes);
+    }
+
+    #[test]
+    fn test_hermes_detected_via_terminal_tool_alone() {
+        // tool_name="terminal" without an event field is still Hermes — no
+        // other supported agent uses the literal string "terminal".
+        let json = r#"{
+            "tool_name":"terminal",
+            "tool_input":{"command":"echo hi"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Hermes);
+    }
+
+    #[test]
+    fn test_hermes_loses_to_copilot_when_event_field_present() {
+        // If the Copilot-specific `event` field is present, we should
+        // NOT misclassify as Hermes — Copilot's payloads can name their
+        // own tools, and we must keep dispatching to Copilot's wire format.
+        let json = r#"{
+            "event":"pre-tool-use",
+            "hook_event_name":"pre_tool_call",
+            "tool_name":"terminal",
+            "tool_input":{"command":"git status"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_hermes_loses_to_copilot_when_tool_args_present() {
+        // tool_args is Copilot-distinctive; if it's present, route to
+        // Copilot regardless of the Hermes-shaped event/tool name.
+        let json = r#"{
+            "hook_event_name":"pre_tool_call",
+            "tool_name":"terminal",
+            "tool_args":"{\"command\":\"git status\"}"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_hermes_pre_tool_call_with_session_envelope_not_gemini() {
+        // Hermes shares `session_id`/`cwd` with Gemini, but the snake_case
+        // event name disambiguates. Regression coverage in the spirit of
+        // issue #77 (Claude/Gemini overlap).
+        let json = r#"{
+            "session_id":"sess",
+            "cwd":"/tmp",
+            "hook_event_name":"pre_tool_call",
+            "tool_name":"terminal",
+            "tool_input":{"command":"ls"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Hermes);
+    }
+
+    #[test]
+    fn test_hermes_hook_output_block_decision_json_shape() {
+        // The struct must serialize with "decision":"block" AND
+        // "action":"block" so either Hermes codepath registers a block.
+        let output = HermesHookOutput {
+            decision: "block",
+            reason: Cow::Borrowed("blocked for safety"),
+            action: "block",
+            message: Cow::Borrowed("blocked for safety"),
+            allow_once_code: None,
+            allow_once_full_hash: None,
+            rule_id: Some("core.git:reset-hard".to_string()),
+            pack_id: Some("core.git".to_string()),
+            severity: None,
+            confidence: None,
+            remediation: None,
+        };
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["reason"], "blocked for safety");
+        assert_eq!(json["action"], "block");
+        assert_eq!(json["message"], "blocked for safety");
+        assert_eq!(json["ruleId"], "core.git:reset-hard");
+        assert_eq!(json["packId"], "core.git");
+        // Hermes rejects "deny"/"continue"/"stopReason" — those are the
+        // wire shapes for OTHER agents and would be ignored here.
+        assert!(json.get("permissionDecision").is_none());
+        assert!(json.get("continue").is_none());
+        assert!(json.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn test_write_denial_hermes_produces_block_json() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Hermes,
+            "rm -rf /",
+            "catastrophic filesystem deletion",
+            Some("core.filesystem"),
+            Some("rm-rf-root"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["action"], "block");
+        assert!(
+            json["reason"]
+                .as_str()
+                .unwrap()
+                .contains("catastrophic filesystem deletion")
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("catastrophic filesystem deletion")
+        );
+        // stderr must contain the colored warning text for human visibility.
+        assert!(
+            !stderr.is_empty(),
+            "Hermes denial must still surface stderr warning text"
+        );
+    }
+
+    #[test]
+    fn test_write_warning_hermes_produces_context_json() {
+        // Hermes has no documented "ask" / "warn" decision. We surface the
+        // warn text via the documented `context` field which is allowed
+        // for any pre_* event and treated as advisory metadata.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Hermes,
+            "git stash drop",
+            "drops stashed changes",
+            Some("core.git"),
+            Some("stash-drop"),
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert!(json["context"].as_str().unwrap().starts_with("DCG warn:"));
+        // Crucially: must NOT carry a "block" decision when warning.
+        assert!(json.get("decision").is_none());
+        assert!(json.get("action").is_none());
+        assert!(!stderr.is_empty(), "stderr must contain warn text");
     }
 
     #[test]

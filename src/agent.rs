@@ -19,6 +19,7 @@
 //! - Gemini CLI: `GEMINI_CLI=1` env var
 //! - Copilot CLI: `COPILOT_CLI=1` or `COPILOT_AGENT_START_TIME_SEC` env var
 //! - Cursor IDE: `CURSOR_IDE=1` env var (set by dcg's Cursor hook script)
+//! - Hermes Agent: `HERMES_AGENT=1` or `HERMES_SESSION_ID` env var
 //!
 //! # Usage
 //!
@@ -61,6 +62,8 @@ pub enum Agent {
     CopilotCli,
     /// Cursor IDE (via beforeShellExecution hook).
     CursorIde,
+    /// `NousResearch` Hermes Agent (via shell `pre_tool_call` hook).
+    Hermes,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -83,6 +86,7 @@ impl Agent {
             Self::GeminiCli => "gemini-cli",
             Self::CopilotCli => "copilot-cli",
             Self::CursorIde => "cursor-ide",
+            Self::Hermes => "hermes",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -101,6 +105,7 @@ impl Agent {
                 | Self::GeminiCli
                 | Self::CopilotCli
                 | Self::CursorIde
+                | Self::Hermes
         )
     }
 
@@ -137,6 +142,7 @@ impl Agent {
             "geminicli" | "gemini" => Self::GeminiCli,
             "copilotcli" | "copilot" => Self::CopilotCli,
             "cursoride" | "cursor" => Self::CursorIde,
+            "hermes" | "hermesagent" | "hermescli" => Self::Hermes,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -154,6 +160,7 @@ impl fmt::Display for Agent {
             Self::GeminiCli => write!(f, "Gemini CLI"),
             Self::CopilotCli => write!(f, "GitHub Copilot CLI"),
             Self::CursorIde => write!(f, "Cursor IDE"),
+            Self::Hermes => write!(f, "Hermes Agent"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -447,6 +454,24 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Hermes Agent detection. Hermes documents `HERMES_ACCEPT_HOOKS` for
+    // bypassing consent prompts; we treat `HERMES_AGENT` / `HERMES_SESSION_ID`
+    // as the canonical session markers (mirroring CLAUDE_CODE / CLAUDE_SESSION_ID).
+    if std::env::var("HERMES_AGENT").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Hermes,
+            DetectionMethod::Environment,
+            Some("HERMES_AGENT".to_string()),
+        ));
+    }
+    if std::env::var("HERMES_SESSION_ID").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Hermes,
+            DetectionMethod::Environment,
+            Some("HERMES_SESSION_ID".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -654,6 +679,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "gemini" | "gemini-cli" => Some(Agent::GeminiCli),
         "copilot" | "copilot-cli" | "gh-copilot" => Some(Agent::CopilotCli),
         "cursor" | "cursor-ide" => Some(Agent::CursorIde),
+        "hermes" | "hermes-agent" | "hermes-cli" => Some(Agent::Hermes),
         _ => None,
     }
 }
@@ -697,6 +723,7 @@ mod tests {
         assert_eq!(Agent::GeminiCli.config_key(), "gemini-cli");
         assert_eq!(Agent::CopilotCli.config_key(), "copilot-cli");
         assert_eq!(Agent::CursorIde.config_key(), "cursor-ide");
+        assert_eq!(Agent::Hermes.config_key(), "hermes");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -730,6 +757,10 @@ mod tests {
         assert_eq!(Agent::from_name("cursor"), Agent::CursorIde);
         assert_eq!(Agent::from_name("cursor-ide"), Agent::CursorIde);
         assert_eq!(Agent::from_name("cursor_ide"), Agent::CursorIde);
+        assert_eq!(Agent::from_name("hermes"), Agent::Hermes);
+        assert_eq!(Agent::from_name("Hermes"), Agent::Hermes);
+        assert_eq!(Agent::from_name("hermes-agent"), Agent::Hermes);
+        assert_eq!(Agent::from_name("hermes_cli"), Agent::Hermes);
 
         // Custom agents
         assert_eq!(
@@ -748,6 +779,7 @@ mod tests {
         assert_eq!(format!("{}", Agent::GeminiCli), "Gemini CLI");
         assert_eq!(format!("{}", Agent::CopilotCli), "GitHub Copilot CLI");
         assert_eq!(format!("{}", Agent::CursorIde), "Cursor IDE");
+        assert_eq!(format!("{}", Agent::Hermes), "Hermes Agent");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -762,6 +794,7 @@ mod tests {
         assert!(Agent::Aider.is_known());
         assert!(Agent::CopilotCli.is_known());
         assert!(Agent::CursorIde.is_known());
+        assert!(Agent::Hermes.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -813,6 +846,12 @@ mod tests {
             agent_from_process_name("gemini.ps1"),
             Some(Agent::GeminiCli)
         );
+        assert_eq!(agent_from_process_name("hermes"), Some(Agent::Hermes));
+        assert_eq!(agent_from_process_name("hermes-agent"), Some(Agent::Hermes));
+        assert_eq!(
+            agent_from_process_name("/usr/local/bin/hermes"),
+            Some(Agent::Hermes)
+        );
     }
 
     #[test]
@@ -845,6 +884,10 @@ mod tests {
         assert_eq!(agent_from_process_name("gemini-tools"), None);
         assert_eq!(agent_from_process_name("copilot-stub"), None);
         assert_eq!(agent_from_process_name("augment-helpers"), None);
+        // Greek mythology should not be auto-classified as Hermes Agent.
+        assert_eq!(agent_from_process_name("hermes-helper"), None);
+        assert_eq!(agent_from_process_name("xhermes"), None);
+        assert_eq!(agent_from_process_name("anti-hermes"), None);
     }
 
     #[test]

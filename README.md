@@ -11,9 +11,9 @@
 
 </div>
 
-A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot, Cursor, and related tools.
+A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot, Cursor, Hermes Agent, and related tools.
 
-**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [Cursor IDE](https://cursor.com), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
+**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -22,7 +22,7 @@ A high-performance hook for AI coding agents that blocks destructive commands be
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
-<p><em>Works on Linux, macOS, and Windows (WSL). Auto-detects your platform, downloads the right binary, and configures supported agent hooks including Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, and Cursor IDE.</em></p>
+<p><em>Works on Linux, macOS, and Windows (WSL). Auto-detects your platform, downloads the right binary, and configures supported agent hooks including Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent.</em></p>
 </div>
 
 ---
@@ -660,7 +660,7 @@ The easiest way to install is using the install script, which downloads a prebui
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
-Easy mode auto-detects your platform, downloads the right binary, verifies SHA256 checksums, configures all supported AI agent hooks (Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Aider), and updates your PATH. For Codex CLI 0.125.0+, the installer merges a `PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed existing Codex hook shapes are left unchanged and reported instead of being overwritten.
+Easy mode auto-detects your platform, downloads the right binary, verifies SHA256 checksums, configures all supported AI agent hooks (Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Aider), and updates your PATH. For Codex CLI 0.125.0+, the installer merges a `PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed existing Codex hook shapes are left unchanged and reported instead of being overwritten.
 
 **Other options:**
 
@@ -706,6 +706,7 @@ The installer also verifies Sigstore cosign bundles when available (falls back t
 - **Codex CLI:** PreToolUse hooks via `~/.codex/hooks.json` (stable in Codex 0.125.0+; the `codex_hooks` feature is on by default). Codex's hook input shape mirrors Claude Code's, but its JSON deny parser is strict (`#[serde(deny_unknown_fields)]`), so dcg detects Codex from the `turn_id` stdin field and switches to Codex's documented stderr deny path with exit code 2; the block message goes to stderr where Codex shows it to the model, without self-service allowlist or allow-once commands. The Unix installer and `install.ps1` both merge dcg's hook into the existing hooks object, detect an already-current dcg hook exactly, leave invalid JSON or malformed hook shapes untouched, and surface the failure reason in the install summary. `uninstall.sh` and `uninstall.ps1` remove only dcg-owned Codex hooks and preserve coexisting entries. See the [Codex integration notes](docs/codex-integration.md). Caveat: the model can still write scripts to disk to bypass hook-based blocking.
 - **GitHub Copilot CLI:** Hooks are repository-local (`.github/hooks/*.json`). Run the installer from each repository where you want protection. The generated hook covers both Unix `bash` and Windows `powershell` tool payloads.
 - **Cursor IDE:** Hooks are configured through `~/.cursor/hooks.json` plus a generated `~/.cursor/hooks/dcg-pre-shell.py` bridge. The installer inserts dcg first in `beforeShellExecution`, collapses duplicate dcg entries, and preserves coexisting Cursor hooks.
+- **Hermes Agent:** [NousResearch's Hermes Agent](https://github.com/NousResearch/hermes-agent) declares shell hooks in `~/.hermes/config.yaml` under `hooks.pre_tool_call`. The installer merges a single `matcher: "terminal"` entry that invokes dcg directly — no wrapper script — because Hermes' input JSON (`hook_event_name: "pre_tool_call"`, `tool_name: "terminal"`, `tool_input.command`) deserializes straight into dcg's existing `HookInput`. Hermes [explicitly documents](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md) that "non-zero exit codes... never abort the agent loop", so dcg switches to Hermes' JSON block protocol on output: `{"decision":"block","reason":...}` (plus the alternate `{"action":"block","message":...}` form for cross-version compatibility). The installer also sets `hooks_auto_accept: true` if not already set; Hermes silently drops un-allowlisted hooks in non-TTY runs (gateway/cron) without it. `unconfigure_hermes` in `uninstall.sh` removes only the dcg-owned entry and leaves `hooks_auto_accept` alone (other Hermes hooks may rely on it).
 - **OpenCode:** Not auto-configured. Requires a Bun-based plugin with `"tool.execute.before"` hook key. A working community plugin: [aspiers/ai-config/dcg-guard.js](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js).
 
 </details>
@@ -779,7 +780,7 @@ irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guar
 ```
 
 The Unix uninstaller:
-- Removes dcg hooks from Claude Code, Codex CLI, Cursor IDE, Gemini CLI, GitHub Copilot CLI (repo-local), and Aider
+- Removes dcg hooks from Claude Code, Codex CLI, Cursor IDE, Gemini CLI, GitHub Copilot CLI (repo-local), Hermes Agent, and Aider
 - Removes the dcg binary
 - Removes configuration (`~/.config/dcg/`) and history (`~/.local/share/dcg/`)
 - Prompts for confirmation before making changes
@@ -1449,7 +1450,7 @@ non-TTY output, dumb terminals, and no-color environments.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│       Claude / Codex / Gemini / Copilot / Cursor hooks           │
+│   Claude / Codex / Gemini / Copilot / Cursor / Hermes hooks      │
 │                                                                  │
 │  User: "delete the build artifacts"                             │
 │  Agent: executes `rm -rf ./build`                               │
@@ -1481,7 +1482,7 @@ non-TTY output, dumb terminals, and no-color environments.
                       ▼ stdout: JSON deny / empty allow
                         stderr: rich human output / Codex deny reason
 ┌─────────────────────────────────────────────────────────────────┐
-│       Claude / Codex / Gemini / Copilot / Cursor hooks           │
+│   Claude / Codex / Gemini / Copilot / Cursor / Hermes hooks      │
 │                                                                  │
 │  If denied: Shows block message, does NOT execute command       │
 │  If allowed: Proceeds with command execution                    │
@@ -2001,6 +2002,7 @@ high-signal formatting.
 |------|---------|--------|--------|
 | Hook allow | Safe command | Empty | Empty |
 | JSON-hook deny | Claude Code, Gemini CLI, Copilot CLI, compatible hooks | Denial JSON | Rich or plain warning |
+| Hermes block | Hermes Agent shell hook (`pre_tool_call`) | `{"decision":"block","reason":...,"action":"block","message":...}` | Rich or plain warning |
 | Codex deny | Codex CLI 0.125.0+ hook input | Empty | Deny reason with command, rule, and remediation |
 | Robot mode | `--robot` or `DCG_ROBOT=1` | JSON | Silent |
 | Plain fallback | `DCG_NO_RICH=1`, `NO_COLOR=1`, `DCG_NO_COLOR=1`, `TERM=dumb`, `CI=1`, non-TTY output, or `--legacy-output` | Mode-specific data | Plain text only |

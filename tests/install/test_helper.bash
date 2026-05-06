@@ -184,6 +184,82 @@ setup_mock_continue() {
     echo '{}' > "$HOME/.continue/config.json"
 }
 
+# Create mock Hermes Agent installation (config dir + optional pre-existing config)
+setup_mock_hermes() {
+    mkdir -p "$HOME/.hermes"
+    HERMES_CONFIG="$HOME/.hermes/config.yaml"
+    export HERMES_CONFIG
+}
+
+hermes_config_file() {
+    echo "${HERMES_CONFIG:-$HOME/.hermes/config.yaml}"
+}
+
+seed_hermes_config() {
+    local cfg
+    cfg="$(hermes_config_file)"
+    mkdir -p "$(dirname "$cfg")"
+    printf '%s\n' "$1" > "$cfg"
+    cp "$cfg" "$TEST_TMPDIR/hermes_config_snapshot.yaml"
+    log_test "Seeded Hermes config: $(cat "$cfg")"
+}
+
+assert_hermes_config_contains() {
+    local cfg
+    cfg="$(hermes_config_file)"
+    grep -qF "$1" "$cfg"
+}
+
+assert_hermes_config_not_contains() {
+    local cfg
+    cfg="$(hermes_config_file)"
+    ! grep -qF "$1" "$cfg"
+}
+
+# Count occurrences of dcg in the pre_tool_call list (requires Python+PyYAML).
+hermes_dcg_pre_tool_call_count() {
+    local cfg
+    cfg="$(hermes_config_file)"
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "?"
+        return 0
+    fi
+    if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        echo "?"
+        return 0
+    fi
+    python3 - "$cfg" <<'PYEOF'
+import os, shlex, sys, yaml
+
+def is_dcg(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+cfg = sys.argv[1]
+try:
+    with open(cfg) as f:
+        data = yaml.safe_load(f) or {}
+except Exception:
+    print(0); sys.exit(0)
+
+hooks = (data or {}).get("hooks") or {}
+ptc = hooks.get("pre_tool_call") if isinstance(hooks, dict) else None
+if not isinstance(ptc, list):
+    print(0); sys.exit(0)
+print(sum(1 for e in ptc if isinstance(e, dict) and is_dcg(e.get("command"))))
+PYEOF
+}
+
 # Create a test file with known content and checksum
 create_test_file_with_checksum() {
     local content="$1"

@@ -114,6 +114,7 @@ fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent:
         hook::HookProtocol::Codex => Agent::CodexCli.config_key(),
         hook::HookProtocol::Gemini => Agent::GeminiCli.config_key(),
         hook::HookProtocol::Copilot => Agent::CopilotCli.config_key(),
+        hook::HookProtocol::Hermes => Agent::Hermes.config_key(),
         hook::HookProtocol::ClaudeCompatible => detected_agent.config_key(),
     }
 }
@@ -126,6 +127,7 @@ fn effective_agent_for_hook_protocol(
         hook::HookProtocol::Codex => Agent::CodexCli,
         hook::HookProtocol::Gemini => Agent::GeminiCli,
         hook::HookProtocol::Copilot => Agent::CopilotCli,
+        hook::HookProtocol::Hermes => Agent::Hermes,
         hook::HookProtocol::ClaudeCompatible => detected_agent.clone(),
     }
 }
@@ -855,7 +857,7 @@ fn print_help() {
     eprintln!("  {}", "USAGE".yellow().bold());
     eprintln!("  {}", "─".repeat(50).bright_black());
     eprintln!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
-    eprintln!("    Gemini CLI, GitHub Copilot CLI, and Cursor IDE.");
+    eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent.");
     eprintln!("    Compatible agents receive stdout JSON; Codex denials use stderr + exit 2.");
     eprintln!();
 

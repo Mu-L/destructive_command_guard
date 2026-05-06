@@ -2905,3 +2905,248 @@ EOF
     assert_codex_hooks_contains "dcg-helper"
     assert_codex_hooks_not_contains "/usr/local/bin/dcg\""
 }
+
+# ============================================================================
+# Hermes Agent Configuration Tests (issue #110)
+# ============================================================================
+
+@test "configure_hermes: skips when not installed" {
+    log_test "Testing Hermes skip when not installed..."
+    HERMES_CONFIG="$HOME/.hermes/config.yaml"
+
+    [ ! -d "$HOME/.hermes" ]
+    ! command -v hermes >/dev/null 2>&1
+
+    configure_hermes
+
+    log_test "HERMES_STATUS: $HERMES_STATUS"
+    [ "$HERMES_STATUS" = "skipped" ]
+    [ ! -f "$HERMES_CONFIG" ]
+}
+
+@test "configure_hermes: creates config.yaml when ~/.hermes exists" {
+    log_test "Testing Hermes config creation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    python3 -c 'import yaml' &>/dev/null || skip "PyYAML not available"
+
+    setup_mock_hermes
+
+    configure_hermes
+
+    log_test "HERMES_STATUS: $HERMES_STATUS"
+    log_test "config.yaml: $(cat "$HERMES_CONFIG" 2>/dev/null || echo 'missing')"
+
+    [ "$HERMES_STATUS" = "created" ]
+    [ -f "$HERMES_CONFIG" ]
+    assert_hermes_config_contains "pre_tool_call"
+    assert_hermes_config_contains "matcher: \"terminal\""
+    assert_hermes_config_contains "$DEST/dcg"
+    # Auto-accept must be set so the hook fires in non-TTY runs.
+    assert_hermes_config_contains "hooks_auto_accept: true"
+}
+
+@test "configure_hermes: is idempotent" {
+    log_test "Testing Hermes install idempotency..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    python3 -c 'import yaml' &>/dev/null || skip "PyYAML not available"
+
+    setup_mock_hermes
+
+    configure_hermes
+    [ "$HERMES_STATUS" = "created" ]
+
+    local first_count
+    first_count="$(hermes_dcg_pre_tool_call_count)"
+    [ "$first_count" = "1" ]
+
+    # Second run: must not produce any change.
+    configure_hermes
+    log_test "Second-run HERMES_STATUS: $HERMES_STATUS"
+    [ "$HERMES_STATUS" = "already" ]
+
+    local second_count
+    second_count="$(hermes_dcg_pre_tool_call_count)"
+    [ "$second_count" = "1" ]
+}
+
+@test "configure_hermes: merges into existing config without dropping user keys" {
+    log_test "Testing Hermes merge preserves coexisting config..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    python3 -c 'import yaml' &>/dev/null || skip "PyYAML not available"
+
+    setup_mock_hermes
+    seed_hermes_config 'model:
+  provider: openrouter
+  name: NousResearch/Hermes-3-405B
+hooks:
+  post_tool_call:
+    - matcher: "write_file"
+      command: "/usr/local/bin/auto-format.sh"
+hooks_auto_accept: false
+'
+
+    configure_hermes
+    log_test "HERMES_STATUS: $HERMES_STATUS"
+    log_test "config.yaml after merge: $(cat "$HERMES_CONFIG")"
+
+    [ "$HERMES_STATUS" = "merged" ]
+
+    # User's pre-existing entries must survive.
+    assert_hermes_config_contains "post_tool_call"
+    assert_hermes_config_contains "auto-format.sh"
+    assert_hermes_config_contains "openrouter"
+    assert_hermes_config_contains "Hermes-3-405B"
+
+    # User's explicit hooks_auto_accept: false MUST be preserved (we only
+    # set when not already set).
+    assert_hermes_config_contains "hooks_auto_accept: false"
+
+    # dcg's hook must be present and unique.
+    assert_hermes_config_contains "$DEST/dcg"
+    [ "$(hermes_dcg_pre_tool_call_count)" = "1" ]
+}
+
+@test "configure_hermes: replaces stale dcg path and dedupes duplicates" {
+    log_test "Testing Hermes stale path rewrite..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    python3 -c 'import yaml' &>/dev/null || skip "PyYAML not available"
+
+    setup_mock_hermes
+    seed_hermes_config "hooks:
+  pre_tool_call:
+    - matcher: \"terminal\"
+      command: \"/old/stale/path/dcg\"
+      timeout: 10
+    - matcher: \"terminal\"
+      command: \"/another/dcg\"
+      timeout: 5
+    - matcher: \"web_search\"
+      command: \"/usr/local/bin/log-search.sh\"
+"
+
+    configure_hermes
+    log_test "HERMES_STATUS: $HERMES_STATUS"
+    log_test "config.yaml after rewrite: $(cat "$HERMES_CONFIG")"
+
+    [ "$HERMES_STATUS" = "merged" ]
+
+    # New dcg path inserted.
+    assert_hermes_config_contains "$DEST/dcg"
+    # Both stale dcg entries removed.
+    assert_hermes_config_not_contains "/old/stale/path/dcg"
+    assert_hermes_config_not_contains "/another/dcg"
+    # Coexisting non-dcg hook preserved.
+    assert_hermes_config_contains "log-search.sh"
+    [ "$(hermes_dcg_pre_tool_call_count)" = "1" ]
+}
+
+@test "configure_hermes: refuses to clobber malformed YAML" {
+    log_test "Testing Hermes invalid YAML preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    python3 -c 'import yaml' &>/dev/null || skip "PyYAML not available"
+
+    setup_mock_hermes
+    # Deliberately broken YAML (unbalanced quotes / colons).
+    seed_hermes_config 'hooks:
+  pre_tool_call:
+    - matcher: "missing-close
+      command: /usr/local/bin/something
+'
+
+    configure_hermes
+
+    log_test "HERMES_STATUS: $HERMES_STATUS"
+    log_test "HERMES_FAILURE_REASON: $HERMES_FAILURE_REASON"
+
+    [ "$HERMES_STATUS" = "failed" ]
+    [[ "$HERMES_FAILURE_REASON" == *"invalid"* ]]
+    # File must be unchanged.
+    grep -qF "missing-close" "$HERMES_CONFIG"
+}
+
+@test "configure_hermes: rejects non-mapping hooks block" {
+    log_test "Testing Hermes non-mapping hooks rejection..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    python3 -c 'import yaml' &>/dev/null || skip "PyYAML not available"
+
+    setup_mock_hermes
+    seed_hermes_config 'hooks:
+  - this should be a mapping not a list
+'
+
+    configure_hermes
+
+    log_test "HERMES_STATUS: $HERMES_STATUS"
+    [ "$HERMES_STATUS" = "failed" ]
+    # Original file preserved verbatim.
+    grep -qF "this should be a mapping not a list" "$HERMES_CONFIG"
+}
+
+@test "configure_hermes: does not treat non-dcg hooks as installed" {
+    log_test "Testing Hermes substring rejection..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    python3 -c 'import yaml' &>/dev/null || skip "PyYAML not available"
+
+    setup_mock_hermes
+    # `dcg-tools` is NOT dcg even though the substring matches.
+    seed_hermes_config 'hooks:
+  pre_tool_call:
+    - matcher: "terminal"
+      command: "/usr/local/bin/dcg-tools"
+'
+
+    configure_hermes
+    log_test "HERMES_STATUS: $HERMES_STATUS"
+    log_test "config.yaml: $(cat "$HERMES_CONFIG")"
+
+    [ "$HERMES_STATUS" = "merged" ]
+    # The fake `dcg-tools` entry is NOT a dcg command, so it must be preserved.
+    assert_hermes_config_contains "dcg-tools"
+    # Real dcg added.
+    assert_hermes_config_contains "$DEST/dcg"
+    # Exactly one real dcg entry (basename match, not substring).
+    [ "$(hermes_dcg_pre_tool_call_count)" = "1" ]
+}
+
+@test "unconfigure_hermes: removes only dcg entries and leaves siblings intact" {
+    log_test "Testing Hermes uninstall..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    python3 -c 'import yaml' &>/dev/null || skip "PyYAML not available"
+
+    setup_mock_hermes
+    # Seed a config with dcg PLUS a sibling hook the user wants to keep.
+    seed_hermes_config "hooks:
+  pre_tool_call:
+    - matcher: \"terminal\"
+      command: \"$DEST/dcg\"
+      timeout: 30
+    - matcher: \"web_search\"
+      command: \"/usr/local/bin/log-search.sh\"
+hooks_auto_accept: true
+"
+
+    run unconfigure_hermes
+    log_test "unconfigure_hermes status: $status"
+    log_test "config.yaml after uninstall: $(cat "$HERMES_CONFIG" 2>/dev/null || echo 'missing')"
+
+    [ "$status" -eq 0 ]
+    [ -f "$HERMES_CONFIG" ]
+
+    # dcg gone.
+    assert_hermes_config_not_contains "$DEST/dcg"
+    # Sibling preserved.
+    assert_hermes_config_contains "log-search.sh"
+    # We deliberately do NOT touch hooks_auto_accept on uninstall.
+    assert_hermes_config_contains "hooks_auto_accept: true"
+}
+
+@test "unconfigure_hermes: noop on missing config" {
+    log_test "Testing Hermes uninstall with no config..."
+
+    HERMES_CONFIG="$HOME/.hermes/config.yaml"
+    [ ! -f "$HERMES_CONFIG" ]
+
+    run unconfigure_hermes
+    log_test "unconfigure_hermes status: $status"
+    [ "$status" -eq 0 ]
+}

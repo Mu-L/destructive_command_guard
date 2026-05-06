@@ -273,6 +273,66 @@ sys.exit(1)
 PYEOF
 }
 
+yaml_hermes_has_dcg_hook() {
+    local cfg_file="$1"
+
+    if [ ! -f "$cfg_file" ]; then
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        # Best-effort: a literal "dcg" mention in the pre_tool_call section
+        # is at least suggestive. We avoid claiming a hit without python3.
+        grep -q 'pre_tool_call' "$cfg_file" 2>/dev/null && grep -q 'dcg' "$cfg_file" 2>/dev/null
+        return $?
+    fi
+
+    python3 - "$cfg_file" <<'PYEOF'
+import os
+import shlex
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(1)
+
+cfg_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(cfg_file, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+except (IOError, yaml.YAMLError):
+    sys.exit(1)
+
+if not isinstance(cfg, dict):
+    sys.exit(1)
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(1)
+pre_tool_call = hooks.get("pre_tool_call")
+if not isinstance(pre_tool_call, list):
+    sys.exit(1)
+for entry in pre_tool_call:
+    if isinstance(entry, dict) and is_dcg_command(entry.get("command")):
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+
 # Remove dcg hook from Claude Code settings
 unconfigure_claude_code() {
     local settings="$HOME/.claude/settings.json"
@@ -822,6 +882,104 @@ PYEOF
     return 0
 }
 
+# Remove dcg hook from Hermes Agent (~/.hermes/config.yaml)
+unconfigure_hermes() {
+    local cfg_file="$HOME/.hermes/config.yaml"
+
+    if [ ! -f "$cfg_file" ]; then
+        return 0
+    fi
+
+    if ! yaml_hermes_has_dcg_hook "$cfg_file"; then
+        return 0
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not available - cannot safely edit Hermes config.yaml"
+        warn "Please manually remove dcg from $cfg_file"
+        return 1
+    fi
+    if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        warn "python3 PyYAML not available - cannot safely edit Hermes config.yaml"
+        warn "Please manually remove dcg from $cfg_file"
+        return 1
+    fi
+
+    python3 - "$cfg_file" <<'PYEOF'
+import os
+import shlex
+import sys
+import yaml
+
+cfg_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str):
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        parts = cmd.split()
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(cfg_file, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+except (IOError, yaml.YAMLError):
+    sys.exit(0)
+
+if not isinstance(cfg, dict):
+    sys.exit(0)
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
+pre_tool_call = hooks.get("pre_tool_call")
+if not isinstance(pre_tool_call, list):
+    sys.exit(0)
+
+filtered = []
+removed = False
+for entry in pre_tool_call:
+    if isinstance(entry, dict) and is_dcg_command(entry.get("command")):
+        removed = True
+        continue
+    filtered.append(entry)
+
+if not removed:
+    sys.exit(0)
+
+if filtered:
+    hooks["pre_tool_call"] = filtered
+else:
+    hooks.pop("pre_tool_call", None)
+    if not hooks:
+        cfg.pop("hooks", None)
+
+# We do NOT touch `hooks_auto_accept` on uninstall: the user may have other
+# hooks declared in this same file (per Hermes' shared config layout) that
+# rely on auto-accept for non-TTY runs. Removing it would silently break
+# their other integrations.
+
+try:
+    if not cfg:
+        os.remove(cfg_file)
+    else:
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+except OSError as exc:
+    print(f"warning: failed to update {cfg_file}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+print("removed", file=sys.stderr)
+PYEOF
+    return $?
+}
+
 # Main uninstall function
 main() {
     log "${BOLD}dcg uninstaller${NC}"
@@ -882,6 +1040,11 @@ main() {
     local codex_hooks_json="$HOME/.codex/hooks.json"
     if json_settings_has_dcg_command_hook "$codex_hooks_json" "PreToolUse" "Bash"; then
         log "  • Codex CLI hook ($codex_hooks_json)"
+        found_anything=1
+    fi
+    local hermes_config="$HOME/.hermes/config.yaml"
+    if yaml_hermes_has_dcg_hook "$hermes_config"; then
+        log "  • Hermes Agent hook ($hermes_config)"
         found_anything=1
     fi
 
@@ -968,6 +1131,11 @@ main() {
     # Remove Codex CLI hook
     if unconfigure_codex 2>&1 | grep -q "removed"; then
         ok "Removed Codex CLI hook"
+    fi
+
+    # Remove Hermes Agent hook
+    if unconfigure_hermes 2>&1 | grep -q "removed"; then
+        ok "Removed Hermes Agent hook"
     fi
 
     # Remove Aider config
