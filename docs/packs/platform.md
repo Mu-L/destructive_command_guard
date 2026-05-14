@@ -7,6 +7,7 @@ This document describes packs in the `platform` category.
 - [GitHub Platform](#platformgithub)
 - [GitLab Platform](#platformgitlab)
 - [Railway Platform](#platformrailway)
+- [Modal Platform](#platformmodal)
 
 ---
 
@@ -249,6 +250,79 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "platform.railway:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Modal Platform
+
+**Pack ID:** `platform.modal`
+
+Protects against destructive Modal CLI operations that can delete or wipe Modal Volumes, Secrets, Apps, Containers, Environments, Dicts, or Queues. Catches commands even when `-y`/`--yes` is passed to bypass interactive confirmation.
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `modal`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `modal-volume-list` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list\|ls)\b` |
+| `modal-volume-get` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:get\|cp\|cat)\b` |
+| `modal-volume-create` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:create\|rename)\b` |
+| `modal-app-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+app\s+(?:list\|ls\|logs\|history\|dashboard\|rollback\|rollover)\b` |
+| `modal-container-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+container\s+(?:list\|ls\|logs\|exec)\b` |
+| `modal-secret-list` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+(?:list\|ls)\b` |
+| `modal-secret-create-no-force` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?![^;&\|\r\n]*(?:--force\|--overwrite)\b)` |
+| `modal-environment-list` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:list\|ls)\b` |
+| `modal-environment-mutate` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:create\|update)\b` |
+| `modal-dict-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+(?:list\|ls\|get\|items\|create)\b` |
+| `modal-queue-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+(?:list\|ls\|peek\|len\|create)\b` |
+| `modal-shell` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+shell\b` |
+| `modal-deploy` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:deploy\|serve\|run\|profile\|launch)\b` |
+| `modal-token` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+token\s+(?:info\|new\|set)\b` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `modal-environment-delete` | modal environment delete schedules removal of an entire Modal environment. | critical |
+| `modal-volume-delete` | modal volume delete removes a Modal Volume and all data inside it. | critical |
+| `modal-secret-delete` | modal secret delete permanently removes a published Modal Secret. | critical |
+| `modal-dict-delete` | modal dict delete removes a named Modal Dict and all its data. | critical |
+| `modal-queue-delete` | modal queue delete removes a named Modal Queue and all its data. | critical |
+| `modal-app-stop` | modal app stop terminates a Modal app and its running containers. | high |
+| `modal-container-stop` | modal container stop terminates a running Modal container and reassigns inputs. | high |
+| `modal-volume-rm-recursive` | modal volume rm -r recursively deletes files inside a Modal Volume. | high |
+| `modal-dict-clear` | modal dict clear empties a Modal Dict. | high |
+| `modal-queue-clear` | modal queue clear drains every message from a Modal Queue. | high |
+| `modal-volume-rm` | modal volume rm deletes a file inside a Modal Volume. | medium |
+| `modal-secret-create-force` | modal secret create --force overwrites an existing Modal Secret in place. | medium |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "platform.modal:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "platform.modal:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```
