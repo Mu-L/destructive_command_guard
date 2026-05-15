@@ -714,6 +714,16 @@ fn test_audit_backtracking_requirements() {
             ]),
         ),
         (
+            // platform.modal uses negative lookahead on two safe patterns to
+            // express "create without --force" and "rm without -r" — the
+            // most natural way to discriminate the safe shape from the
+            // adjacent destructive shape with the same prefix. The lookaheads
+            // were added in `97e993f` (#116 follow-up: shell line-continuation
+            // fix) so this entry is intentional, not a regression.
+            "platform.modal",
+            HashSet::from(["modal-secret-create-no-force", "modal-volume-rm"]),
+        ),
+        (
             "remote.scp",
             HashSet::from(["scp-to-home", "scp-to-tmp", "scp-to-var-tmp"]),
         ),

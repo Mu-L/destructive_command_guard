@@ -152,6 +152,8 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             // --force ...` (continued across lines) is falsely matched as
             // safe — the lookahead stops at `\n` and never sees `--force`.
             // Mirrors the destructive pattern's `(?:[^;&|\r\n]|\\\r?\n)*` body.
+            // The pattern is allow-listed in `pattern_audit.rs` because the
+            // `(?!...)` lookahead forces use of the backtracking engine.
             r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?!(?:[^;&|\r\n]|\\\r?\n)*(?:--force|--overwrite)\b)"
         ),
         // Environment — list and non-destructive lifecycle
@@ -278,6 +280,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // across lines) is correctly routed to the High-severity recursive
             // pattern rather than falling through to this Medium pattern. Same
             // asymmetry-fix as the secret-create-no-force lookahead above.
+            // Allow-listed in `pattern_audit.rs`.
             r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+rm\b(?!(?:[^;&|\r\n]|\\\r?\n)*(?:\s|=)(?:-r\b|-R\b|--recursive\b))",
             "modal volume rm deletes a file inside a Modal Volume.",
             Medium,
