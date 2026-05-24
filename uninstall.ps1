@@ -190,7 +190,15 @@ function Remove-DcgHooksFromJsonFile {
   if ((Test-EmptyObject $config) -and $DeleteEmptyFile) {
     Remove-Item -Force -Path $Path
   } else {
-    $config | ConvertTo-Json -Depth 20 | Set-Content -Path $Path -Encoding UTF8
+    # Write UTF-8 without BOM: Codex's JSON parser rejects the BOM byte sequence
+    # at offset 0 ("expected value at line 1 column 1"), and `Set-Content -Encoding UTF8`
+    # on Windows PowerShell 5.1 writes a BOM. Use the .NET API directly because
+    # `-Encoding UTF8NoBOM` is PowerShell 6+ only. Mirrors the install.ps1 fix. (#125)
+    [System.IO.File]::WriteAllText(
+      $Path,
+      ($config | ConvertTo-Json -Depth 20),
+      (New-Object System.Text.UTF8Encoding $false)
+    )
   }
 
   $true
