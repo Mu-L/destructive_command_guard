@@ -1272,6 +1272,12 @@ fn extract_inline_scripts(
 
             // The regex covers multiple interpreters; validate that the matched flag actually
             // implies inline code for this interpreter (e.g. bash needs -c, perl needs -e/-E).
+            // PowerShell host names are case-insensitive on Windows
+            // (`powershell`, `PowerShell.exe`, `pwsh`). Computed up front so the
+            // branch condition below isn't a block (clippy::blocks_in_conditions). (#125)
+            let cmd_lower = cmd_name.to_ascii_lowercase();
+            let is_powershell =
+                cmd_lower.starts_with("powershell") || cmd_lower.starts_with("pwsh");
             let is_inline_flag = if cmd_name.starts_with("python") {
                 flag.contains('c') || flag.contains('e')
             } else if cmd_name.starts_with("ruby") || cmd_name.starts_with("irb") {
@@ -1284,15 +1290,9 @@ fn extract_inline_scripts(
                 flag.contains('r')
             } else if cmd_name.starts_with("lua") {
                 flag.contains('e')
-            } else if {
-                // PowerShell host names are case-insensitive on Windows
-                // (`powershell`, `PowerShell.exe`, `pwsh`). The inline-execution
-                // flag is `-Command`, which PowerShell accepts as any unambiguous
-                // prefix (`-c`, `-co`, `-com`, …), case-insensitively. (#125)
-                let lower = cmd_name.to_ascii_lowercase();
-                lower.starts_with("powershell") || lower.starts_with("pwsh")
-            } {
-                // `-Command` / `-c` (the leading char after `-` is C/c)
+            } else if is_powershell {
+                // The inline-execution flag is `-Command`, which PowerShell accepts as
+                // any unambiguous prefix (`-c`, `-co`, `-com`, …), case-insensitively. (#125)
                 let f = flag.to_ascii_lowercase();
                 f.starts_with("-c")
             } else {
