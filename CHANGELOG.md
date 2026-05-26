@@ -11,7 +11,40 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [v0.5.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.4) -- 2026-05-25 [Release]
+## [v0.5.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.5) -- 2026-05-26 [Release]
+
+Fixes the history full-text-search rebuild, which was broken by an upstream
+FrankenSQLite bug.
+
+### History FTS
+
+- **`rebuild_fts` / FTS-backed history no longer raise `Sqlite(PrimaryKeyViolation)`.**
+  FrankenSQLite did not intercept `DELETE` against a live FTS5 virtual table: the
+  generic table-delete emptied the backing B-tree but left the in-memory FTS5
+  module instance stale, so the `DELETE FROM commands_fts; <re-INSERT>` rebuild
+  pattern collided on re-insert of the same rowid. Fixed upstream in
+  [frankensqlite#94](https://github.com/Dicklesworthstone/frankensqlite/issues/94)
+  (commit `a0425adb` — live virtual-table DELETE now routes through the module's
+  per-row `xUpdate` delete, matching SQLite). dcg pins that fix via a git rev of
+  `fsqlite`/`fsqlite-types`/`fsqlite-error`. The three previously-failing
+  `history::schema` FTS tests now pass.
+
+### Packaging note
+
+- This release is distributed as **GitHub-release binaries** (the primary install
+  path). Because it pins FrankenSQLite to a git revision pending an `fsqlite`
+  crates.io release, **v0.5.5 is not published to crates.io**; the registry stays
+  at v0.5.4 for the guard feature (the FTS-rebuild fix lands there once `fsqlite`
+  publishes the fix).
+
+---
+
+## [v0.5.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.4) -- 2026-05-25 [crates.io only — no GitHub binaries]
+
+Published to **crates.io** (first registry publish of the 0.5.x line since
+v0.4.5), but the GitHub-release binaries did **not** ship: the `dist` run was
+blocked first by `cargo fmt`/clippy and then by the FrankenSQLite FTS5 bug above.
+GitHub binaries resume at v0.5.5.
 
 First successful release and crates.io publish of the 0.5.x line since v0.4.5:
 v0.5.0–v0.5.2 were cut as GitHub releases but never published to the registry,
