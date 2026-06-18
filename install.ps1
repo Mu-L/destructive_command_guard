@@ -374,7 +374,13 @@ if (Get-Command cosign -ErrorAction SilentlyContinue) {
   Write-Info "Fetching sigstore bundle from $SigstoreBundleUrl"
   try {
     Invoke-WebRequest -Uri $SigstoreBundleUrl -OutFile $bundleFile -UseBasicParsing
-    & cosign verify-blob --bundle $bundleFile --certificate-identity-regexp $CosignIdentityRegex --certificate-oidc-issuer $CosignOidcIssuer $zipFile | Out-Null
+    # --new-bundle-format: the release ships the modern Sigstore protobuf
+    # bundle (v0.3, cert under verificationMaterial.certificate) produced by
+    # cosign v3.x in dist.yml. Without this flag, older cosign clients parse
+    # --bundle as the legacy format, miss the embedded cert, and fail with
+    # "bundle does not contain cert for verification, please provide public
+    # key" (issue #140). The flag is accepted by every cosign >= 2.3.0.
+    & cosign verify-blob --new-bundle-format --bundle $bundleFile --certificate-identity-regexp $CosignIdentityRegex --certificate-oidc-issuer $CosignOidcIssuer $zipFile | Out-Null
     if ($LASTEXITCODE -ne 0) {
       Write-Err "Signature verification failed"
       exit 1

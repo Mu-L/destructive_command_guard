@@ -941,7 +941,19 @@ verify_sigstore_bundle() {
     return 0
   fi
 
+  # The release is signed by cosign v3.x (sigstore/cosign-installer in
+  # dist.yml), which emits the modern Sigstore protobuf bundle
+  # (mediaType "application/vnd.dev.sigstore.bundle.v0.3+json", with the
+  # signing cert under verificationMaterial.certificate). Newer cosign
+  # auto-detects that shape from --bundle, but older clients (< the
+  # auto-detect change, roughly cosign 2.x without this flag) treat
+  # --bundle as the *legacy* cosign bundle format, fail to find the cert,
+  # and abort with "bundle does not contain cert for verification, please
+  # provide public key" (issue #140). --new-bundle-format makes cosign
+  # parse the protobuf bundle unambiguously and is accepted by every
+  # cosign >= 2.3.0, so it fixes old clients without regressing new ones.
   if ! cosign verify-blob \
+    --new-bundle-format \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
