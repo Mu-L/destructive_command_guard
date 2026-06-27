@@ -14,13 +14,14 @@ This document describes packs in the `infrastructure` category.
 
 **Pack ID:** `infrastructure.terraform`
 
-Protects against destructive Terraform operations like destroy, taint, and apply with -auto-approve
+Protects against destructive Terraform/OpenTofu operations like destroy, taint, and apply with -auto-approve
 
 ### Keywords
 
 Commands containing these keywords are checked against this pack:
 
 - `terraform`
+- `tofu`
 - `destroy`
 - `taint`
 - `state`
@@ -31,17 +32,17 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `terraform-plan` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
-| `terraform-init` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s\|$)` |
-| `terraform-validate` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
-| `terraform-fmt` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s\|$)` |
-| `terraform-show` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
-| `terraform-output` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
-| `terraform-state-list` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s\|$)` |
-| `terraform-state-show` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s\|$)` |
-| `terraform-graph` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s\|$)` |
-| `terraform-version` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
-| `terraform-providers` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s\|$)` |
+| `terraform-plan` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
+| `terraform-init` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s\|$)` |
+| `terraform-validate` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
+| `terraform-fmt` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s\|$)` |
+| `terraform-show` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
+| `terraform-output` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
+| `terraform-state-list` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s\|$)` |
+| `terraform-state-show` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s\|$)` |
+| `terraform-graph` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s\|$)` |
+| `terraform-version` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
+| `terraform-providers` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -49,14 +50,14 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `plan-destroy` | terraform plan -destroy shows what would be destroyed. Review carefully before applying. | medium |
-| `destroy` | terraform destroy removes ALL managed infrastructure. Use 'terraform plan -destroy' first. | critical |
-| `apply-auto-approve` | terraform apply -auto-approve skips confirmation. Remove -auto-approve for safety. | high |
-| `taint` | terraform taint marks a resource to be destroyed and recreated on next apply. | high |
-| `state-rm` | terraform state rm removes resource from state without destroying it. Resource becomes unmanaged. | high |
-| `state-mv` | terraform state mv moves resources in state. Incorrect moves can cause resource recreation. | high |
-| `force-unlock` | terraform force-unlock removes state lock. Only use if lock is stale. | high |
-| `workspace-delete` | terraform workspace delete removes a workspace. Ensure it's not in use. | medium |
+| `plan-destroy` | terraform/tofu plan -destroy shows what would be destroyed. Review carefully before applying. | medium |
+| `destroy` | terraform/tofu destroy removes ALL managed infrastructure. Use 'terraform plan -destroy' first. | critical |
+| `apply-auto-approve` | terraform/tofu apply -auto-approve skips confirmation. Remove -auto-approve for safety. | high |
+| `taint` | terraform/tofu taint marks a resource to be destroyed and recreated on next apply. | high |
+| `state-rm` | terraform/tofu state rm removes resource from state without destroying it. Resource becomes unmanaged. | high |
+| `state-mv` | terraform/tofu state mv moves resources in state. Incorrect moves can cause resource recreation. | high |
+| `force-unlock` | terraform/tofu force-unlock removes state lock. Only use if lock is stale. | high |
+| `workspace-delete` | terraform/tofu workspace delete removes a workspace. Ensure it's not in use. | medium |
 
 ### Allowlist Guidance
 
