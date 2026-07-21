@@ -11,6 +11,39 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Packs
+
+- **Close the PowerShell .NET recursive-delete false negative (#222).**
+  `windows.filesystem` previously only understood cmdlet spellings, so
+  `[System.IO.Directory]::Delete($path, $true)` — the .NET equivalent of
+  `Remove-Item -Recurse -Force`, callable from plain PowerShell with no
+  external tool — was allowed. New rules deny the static-method form
+  (`dotnet-directory-delete-recursive` Critical for a literally-true second
+  argument, `dotnet-directory-delete` High for dynamic-flag and
+  single-argument calls, both namespace spellings `[System.IO.Directory]` and
+  `[IO.Directory]`) and the instance-method spelling
+  `<DirectoryInfo>.Delete($true)` (`directoryinfo-delete-recursive` Critical,
+  covering `(Get-Item $path).Delete($true)` and `[System.IO.DirectoryInfo]`
+  variables). Detection runs in the caller-dialect semantic pass (so proven
+  PowerShell callers are covered) and as raw patterns for unknown callers;
+  wholly quoted spellings remain inert data for proven-PowerShell callers.
+  Read-only APIs (`::Exists`, `::GetFiles`, `::CreateDirectory`) and member
+  deletes without a literal `$true` do not match.
+
+- **Guard the Snowflake CLI's direct object-lifecycle surface (#212
+  follow-up).** The `database.snowflake` pack's semantic layer covers SQL
+  submitted through `snow sql`; the CLI can also drop live objects with no SQL
+  payload at all. New pattern-based rules deny `snow object drop`
+  (database/schema Critical, other types High), `snow stage drop` and
+  `snow stage remove`, `snow app teardown`, `snow app version drop`,
+  `snow snowpark drop`, `snow dbt drop`, `snow dcm drop`, and `snow spcs
+  service|compute-pool|image-repository drop`, including `--force`/`--cascade`
+  variants and interspersed global options. Read-only `snow object
+  list/describe`, `snow stage list/list-files/describe`, and `snow stage copy`
+  remain unmatched.
+
 ## [v0.6.9](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.9) -- 2026-07-18 [Release]
 
 Security and correctness release that supersedes the unpublished v0.6.8 source

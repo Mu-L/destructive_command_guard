@@ -72,7 +72,10 @@ to the always-on `core.filesystem` / `core.git` and default-on `system.disk`):
 - **`windows.filesystem`** (default-on, opt-out with `disabled = ["windows.filesystem"]` or `["windows"]`):
   cmd `del /s`, `rd /s` / `rmdir /s`, `format <drive>:`; PowerShell `Remove-Item
   -Recurse` (with or without `-Force`) and its aliases (`rm`/`del`/`rd`/`ri`/`erase`), `Clear-Content`,
-  `Clear-RecycleBin`. Whitelists PowerShell `-WhatIf` previews only on
+  `Clear-RecycleBin`, and the .NET recursive-delete APIs callable from plain
+  PowerShell: `[System.IO.Directory]::Delete($path, $true)` (also the
+  `[IO.Directory]` accelerator spelling) and `<DirectoryInfo>.Delete($true)`.
+  Whitelists PowerShell `-WhatIf` previews only on
   cmdlets/aliases that honor it, plus deletes scoped to temp dirs.
 - **`windows.system`** (default-on, opt-out as above): `vssadmin delete shadows`
   and `wmic shadowcopy delete` (Volume Shadow Copy destruction — a ransomware

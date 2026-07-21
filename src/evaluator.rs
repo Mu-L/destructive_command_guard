@@ -20521,6 +20521,26 @@ mod tests {
             ),
             (
                 ShellDialect::PowerShell,
+                r"[System.IO.Directory]::Delete('C:\src', $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"[IO.Directory]::Delete($path, $flag)",
+                "dotnet-directory-delete",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"(Get-Item 'C:\src').Delete($true)",
+                "directoryinfo-delete-recursive",
+            ),
+            (
+                ShellDialect::Unknown,
+                r"[System.IO.Directory]::Delete('C:\src', $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
                 r"ReMoVe-ItEm -Recurse -Force C:\src",
                 "remove-item-recurse-force",
             ),
