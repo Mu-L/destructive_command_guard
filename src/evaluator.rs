@@ -13013,6 +13013,17 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             };
 
+            // A `>` inside quoted argument data is a literal byte, not a shell
+            // redirect operator; skip the `core.filesystem` redirect rules when
+            // the operator offset lies inside an inert quoted span (#225). The
+            // anti-bypass forms keep the operator outside the quotes, so they
+            // still match here.
+            if is_core_filesystem_redirect_rule(pack_id, pattern.name)
+                && crate::context::offset_is_quoted_data(command_for_packs, span.start)
+            {
+                continue;
+            }
+
             // Non-filesystem packs already checked each segment above, so skip
             // duplicate full-command matches that sit wholly inside one segment.
             // core.filesystem uses its specialized rm parser instead of that
@@ -14060,6 +14071,17 @@ fn evaluate_core_filesystem_pack(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// True for the `core.filesystem` truncating-redirect rules, whose regexes match
+/// a `>` operator followed by a sensitive path. These are the rules that must be
+/// span-gated so a literal `>` inside quoted argument data does not fire (#225).
+fn is_core_filesystem_redirect_rule(pack_id: &str, name: Option<&str>) -> bool {
+    pack_id == "core.filesystem"
+        && matches!(
+            name,
+            Some("redirect-truncate-root-home" | "redirect-truncate-dynamic-path")
+        )
+}
+
 fn evaluate_pack_destructive_patterns(
     pack_id: &str,
     pack: &crate::packs::Pack,
@@ -14177,6 +14199,23 @@ fn evaluate_pack_destructive_patterns(
             .is_some_and(|span| span_is_inside_any_segment(*span, ignored_ranges))
         {
             continue;
+        }
+
+        // A `core.filesystem` redirect rule matches the byte sequence `>` +
+        // sensitive path anywhere in the command, including inside a quoted
+        // string where `>` is a literal byte and not a shell redirect operator
+        // (issue #225: `br create --body 'see series/<digest>/ ...'`,
+        // `psql -c 'SELECT 1 where a>/etc/x'`). Skip the match when the operator
+        // offset lies inside an inert quoted span. The anti-bypass cases
+        // (`"git">/dev/null reset --hard`) keep the operator *outside* the
+        // quotes, so they remain matched.
+        if is_core_filesystem_redirect_rule(pack_id, pattern.name) {
+            if let Some(span) = matched_span.as_ref() {
+                let raw_start = span.start.saturating_sub(slice_offset);
+                if crate::context::offset_is_quoted_data(pattern_command, raw_start) {
+                    continue;
+                }
+            }
         }
 
         let reason = pattern.reason;
